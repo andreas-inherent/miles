@@ -4,6 +4,7 @@ import torch
 
 from miles import platforms
 from miles.backends.fsdp_utils.arguments import FSDPArgs, build_dataclass_parser, load_args_from_parser
+from miles.platforms import tpu_shared_slice
 from miles.utils.lora.utils import is_lora_enabled, lora_rollout_enabled
 
 
@@ -81,6 +82,11 @@ def validate_torchtitan_args(args) -> None:
             f"on {platform.device_type} the trainer syncs weights with --update-weight-transfer-mode "
             f"{' or '.join(sorted(modes))} to disaggregated engines; got "
             f"{args.update_weight_transfer_mode!r}{' with --colocate' if args.colocate else ''}"
+        )
+    if args.update_weight_transfer_mode == "ici" and tpu_shared_slice.spec() is None:
+        raise ValueError(
+            f"--update-weight-transfer-mode ici needs {tpu_shared_slice.ENV_VAR} on the trainer, naming the slice "
+            "it shares with the engine"
         )
     if args.ref_update_interval is not None:
         raise ValueError("--ref-update-interval is not supported by the torchtitan backend")

@@ -871,7 +871,7 @@ def miles_validate_args(args):
         _apply_custom_config(args, yaml.safe_load(resolve_file_arg(args.custom_config_path)) or {})
 
     mode = args.update_weight_transfer_mode
-    if mode not in ("broadcast", "broadcast_packed", "p2p", "disk-delta"):
+    if mode not in ("broadcast", "broadcast_packed", "p2p", "disk-delta", "ici"):
         raise ValueError(f"Unknown --update-weight-transfer-mode {mode!r}")
     if mode == "broadcast_packed" and (args.train_backend != "megatron" or args.colocate):
         raise ValueError("broadcast_packed requires Megatron non-colocated weight transfer")

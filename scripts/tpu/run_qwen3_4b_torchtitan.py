@@ -3,7 +3,8 @@
 The host's 8 TensorCores are split in half. `sglang` serves the policy on devices 4-7 (chips 2-3);
 `train` runs the torchtitan trainer as 4 ranks on devices 0-3 (chips 0-1) and drives that server as an
 external rollout engine. Weights reach the server through shared memory (`--weight-transfer shm`, the
-default) or a shared filesystem (`disk`). Run `sglang` in its own shell (it stays in the foreground), wait
+default), a shared filesystem (`disk`), or device to device over ICI (`ici`: both halves form one 8-device slice,
+so start `sglang` and `train` with the same `--weight-transfer ici`). Run `sglang` in its own shell (it stays in the foreground), wait
 for it to report healthy, then run `train`. scripts/tpu/README.md describes the environment both expect.
 
 Args:
@@ -11,8 +12,9 @@ Args:
   --model-dir / --data-dir: directories holding Qwen3-4B / dapo-math-17k and aime-2024.
   --sglang-port: port of the sglang server `train` connects to.
   --sglang-env-script: sglang-torchtpu's environment script, sourced before the server starts.
-  --weight-transfer: shm (default) or disk.
+  --weight-transfer: shm (default), disk or ici.
   --weight-dir: where `disk` writes the weights.
+  --slice-port-base: first of the 9 local ports the shared slice uses under `ici` (8 slice builders, 1 store).
   --wandb-project: wandb project; empty disables wandb (the key comes from WANDB_API_KEY or ~/.netrc).
   --extra-args: more train.py flags, appended last.
 
@@ -36,6 +38,8 @@ NUM_TRAINER_DEVICES = 4
 NUM_ENGINE_DEVICES = 4
 SGLANG_BASE_DEVICE = 4
 HALF_HOST_TOPOLOGY = "1,2,1,2"
+WHOLE_HOST_TOPOLOGY = "2,2,1,2"
+SLICE_SIZE = NUM_TRAINER_DEVICES + NUM_ENGINE_DEVICES
 
 
 @dataclass(frozen=True)
@@ -64,7 +68,8 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     sglang_port: int = 30000
     sglang_env_script: str = "/sgl-workspace/sglang/benchmark/tpu/common_env.sh"
     weight_dir: str = "/dev/shm/miles_weights"
-    weight_transfer: Literal["shm", "disk"] = "shm"
+    weight_transfer: Literal["shm", "disk", "ici"] = "shm"
+    slice_port_base: int = 30100
     wandb_project: str = "miles-tpu"
     extra_args: str = ""
 
@@ -79,22 +84,45 @@ def _free_ports(count: int) -> list[int]:
     return ports
 
 
-def _set_half_host_env() -> None:
+def _set_tpu_env(args: ScriptArgs) -> None:
     # The trainer and sglang each address a 2-chip sub-slice; a chip mask hangs libtpu's session setup.
     for key in ("TPU_VISIBLE_CHIPS", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS"):
         os.environ.pop(key, None)
-    os.environ["TORCH_TPU_TOPOLOGY"] = HALF_HOST_TOPOLOGY
     os.environ.setdefault("TPU_STDERR_LOG_LEVEL", "1")
     os.environ.setdefault("TPU_MIN_LOG_LEVEL", "1")
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+    if args.weight_transfer != "ici":
+        os.environ["TORCH_TPU_TOPOLOGY"] = HALF_HOST_TOPOLOGY
+        return
+    # Both halves form one slice: one topology, slice builders and libtpu flag set for both jobs.
+    os.environ["TORCH_TPU_TOPOLOGY"] = WHOLE_HOST_TOPOLOGY
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+        f"localhost:{args.slice_port_base + index}" for index in range(SLICE_SIZE)
+    )
+    os.environ.setdefault("LIBTPU_INIT_ARGS", _TRAINER_LIBTPU_ARGS)  # sglang's env script keeps a set one
+    # libtpu cannot load a serialized executable built for part of a slice, so nothing may come from a cache
+    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
+    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "0"
+    os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "0"
+
+
+def _shared_slice(args: ScriptArgs, rank_offset: int) -> str:
+    """The shared-slice spec of a job whose ranks start at ``rank_offset``; the store sits after the builders."""
+    return f"{rank_offset},{SLICE_SIZE},localhost:{args.slice_port_base + SLICE_SIZE}"
 
 
 def _serve_sglang(args: ScriptArgs):
     U = args.create_backend()
-    _set_half_host_env()
+    _set_tpu_env(args)
+    # on a shared slice the engine addresses its devices through the slice, not a colocated device mask
+    placement_env = (
+        f"SGLANG_TPU_SHARED_SLICE={_shared_slice(args, rank_offset=NUM_TRAINER_DEVICES)} "
+        if args.weight_transfer == "ici"
+        else "SGLANG_TPU_PD_COLOCATED=1 "
+    )
     U.exec_command_cpu(
         f"source {args.sglang_env_script} && "
-        "SGLANG_TPU_PD_COLOCATED=1 python3 -m sglang.launch_server "
+        f"{placement_env}python3 -m sglang.launch_server "
         f"--model-path {args.model_dir}/{MODEL_NAME} "
         "--device tpu "
         "--dtype bfloat16 "
@@ -136,12 +164,15 @@ _TRAINER_LIBTPU_ARGS = (
 def _execute(args: ScriptArgs):
     U = args.create_backend()
     recipe = _RECIPES[args.recipe]
-    _set_half_host_env()
+    _set_tpu_env(args)
     os.environ["MILES_ACCELERATOR"] = "tpu"
     os.environ.setdefault("LIBTPU_INIT_ARGS", _TRAINER_LIBTPU_ARGS)  # a caller's flag set wins
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"localhost:{port}" for port in _free_ports(NUM_TRAINER_DEVICES)
-    )
+    if args.weight_transfer == "ici":
+        os.environ["MILES_TPU_SHARED_SLICE"] = _shared_slice(args, rank_offset=0)
+    else:
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+            f"localhost:{port}" for port in _free_ports(NUM_TRAINER_DEVICES)
+        )
     # wandb's system-stats sampler polls the node's TPU device plugin, whose restarts kill TPU sessions.
     os.environ.setdefault("WANDB_X_DISABLE_STATS", "true")
     # exported rather than passed as extra_env_vars so execute_train skips its nvidia-smi probe

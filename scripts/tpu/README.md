@@ -55,6 +55,27 @@ Model and data default to `/root/models` and `/root/datasets` (`--model-dir`, `-
 wandb is on when `WANDB_API_KEY` is set or `~/.netrc` holds the key; `--wandb-project ""`
 turns it off.
 
+## Weight sync over ICI
+
+`--weight-transfer ici` makes the two halves one 8-device slice, so each trainer rank sends its bucket straight
+to the paired engine TP rank (Qwen3-4B: about 1 s per sync instead of 3-4 s through shared memory). Start both
+commands with it:
+
+```bash
+python3 scripts/tpu/run_qwen3_4b_torchtitan.py sglang --weight-transfer ici
+python3 scripts/tpu/run_qwen3_4b_torchtitan.py train --recipe full --weight-transfer ici
+```
+
+It needs, beyond the environment above:
+
+- a torch_tpu build with job-local worlds (`TORCH_TPU_JOB_DEVICE_IDS`), so each job compiles and runs its
+  collectives over its own devices: https://github.com/google-pytorch/torch_tpu (pull request pending);
+- sglang-torchtpu's shared-slice receiver: https://github.com/sgl-project/sglang-torchtpu/pull/1884;
+- libtpu 0.0.48: 0.0.49 and later halt the SparseCore when two jobs share the slice.
+
+Compiled programs are not cached under `ici` (libtpu cannot load an executable built for part of a slice),
+so the first step recompiles everything.
+
 ## Notes
 
 - **Stop a training run gracefully while sglang is running.** The host's TPU network session is
