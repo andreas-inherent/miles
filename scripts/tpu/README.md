@@ -69,7 +69,7 @@ python3 scripts/tpu/run_qwen3_4b_torchtitan.py train --recipe full --weight-tran
 It needs, beyond the environment above:
 
 - a torch_tpu build with job-local worlds (`TORCH_TPU_JOB_DEVICE_IDS`), so each job compiles and runs its
-  collectives over its own devices: https://github.com/google-pytorch/torch_tpu (pull request pending);
+  collectives over its own devices: https://github.com/google-pytorch/torch_tpu/pull/6110;
 - sglang-torchtpu's shared-slice receiver: https://github.com/sgl-project/sglang-torchtpu/pull/1884;
 - libtpu 0.0.48: 0.0.49 and later halt the SparseCore when two jobs share the slice.
 
