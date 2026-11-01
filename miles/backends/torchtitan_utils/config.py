@@ -175,7 +175,11 @@ def build_trainer_config(
         logger.info("Checkpoint ties lm_head to the embedding; excluding lm_head.weight from the HF export")
     if with_lora:
         model = lora.convert_model_config(
-            model, hf_targets=args.hf_lora_targets, rank=args.lora_rank, alpha=args.lora_alpha
+            model,
+            hf_targets=args.hf_lora_targets,
+            layout=args.hf_lora_layout,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
         )
 
     return TitanTrainer.Config(

@@ -263,6 +263,10 @@ _HF_LORA_MODELS = {
     "glm5_next": _HfLoraModelSpec(
         _glm5_next_targets, layer_prefix="model.language_model.layers.*", unwrap_text_config=True
     ),
+    # dense; the attention output gate (self_attn.gate_proj) stays out until sglang's LoRA serves it
+    "muse_glimmer": _HfLoraModelSpec(
+        _dense_targets, layer_prefix="model.language_model.layers.*", unwrap_text_config=True
+    ),
     "mimo_v2": _HfLoraModelSpec(_mimo_v2_targets),
     "inkling_text": _HfLoraModelSpec(_inkling_targets, default_train_unembed=True),
     "inkling_model": _HfLoraModelSpec(_inkling_targets, default_train_unembed=True),
