@@ -1,0 +1,676 @@
+From 792c0f088be0d16aeaeb322d5d20e081cd3c3275 Mon Sep 17 00:00:00 2001
+From: Hejian Sang <sanghj0923@gmail.com>
+Date: Sat, 31 Oct 2026 09:40:21 -0700
+Subject: [PATCH] Let jobs that share a TPU slice form their own process groups
+
+Problem: PJRT needs WORLD_SIZE equal to the slice's device count, so every
+process on a shared slice starts the runtime for the whole slice. After the
+first (slice-sized) ProcessGroupTpu defines the world, every later group
+gathers its membership across all slice processes and must partition the
+slice, with a per-process gather counter. Two independent jobs on one slice
+(e.g. an RL trainer on devices 0-3 and an inference engine on 4-7) must then
+create every group in lockstep, and neither can init its own 4-rank
+torch.distributed world.
+
+Design (opt-in through TORCH_TPU_JOB_DEVICE_IDS, the comma-separated global
+device ids of this job's processes in job-rank order):
+- The first, slice-sized group still defines the world (rank-to-device map,
+  topology order) and carries cross-job send/recv.
+- A later group smaller than the slice is job-local: its layout is gathered
+  among the job's processes only, in job-rank space, through the group's own
+  store, then mapped back to world ranks. Its collectives compile on its own
+  devices as before, and its global device assignment covers the job's
+  layout, so programs mixing a job's groups still tile correctly. This
+  covers the job's default group from init_process_group(world_size=4).
+- Job-local gathers use their own counter and a key scope naming the job
+  ("pg_sub:job<first id>:<n>:<rank>"), so the jobs' differing group counts
+  do not shift the slice-wide gather ids and jobs sharing a root store do
+  not collide. GatherSubgroupsViaNodeLocalStore takes the scope as a string;
+  slice-wide keys are unchanged.
+- The node-local store is off in job mode: it expects every device of the
+  host to join each gather under one launcher.
+- A group smaller than the slice that holds another job's processes fails
+  the job-scoped partition check with an error naming the env var.
+
+Unset env var: behavior is unchanged.
+
+Limits: slice-sized groups other than the first (and collectives on the
+slice group) still need every process of both jobs in the same order; a
+job's layouts must partition the job, as layouts partition the world today;
+size-1 groups keep the slice-wide layout; there is no public API to create
+the slice group besides the tpu_dist backend constructor.
+
+Tests: tests/distributed/job_local_process_group_test.py runs two 4-process
+jobs on an 8-device v7x host with different group counts and orders,
+collectives and a mixed compiled program inside each job, cross-job
+send/recv and an all-reduce on the slice group. Error coverage baseline,
+API baseline and docs updated. Not built or run yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ csrc/common/env_vars.h                        |   7 +
+ csrc/distributed/process_group_tpu.cc         | 105 +++++++++-
+ csrc/distributed/process_group_tpu.h          |  14 +-
+ csrc/distributed/process_group_tpu_test.cc    |   4 +-
+ docs/distributed_support.md                   |  31 +++
+ docs/public_apis.md                           |   1 +
+ docs/source/distributed_support.py            |  32 +++
+ tests/api/tt_apis.yaml                        |   1 +
+ tests/distributed/BUILD                       |  31 +++
+ .../job_local_process_group_test.py           | 190 ++++++++++++++++++
+ tests/error_coverage_data.yaml                |   2 +-
+ 11 files changed, 407 insertions(+), 11 deletions(-)
+ create mode 100644 tests/distributed/job_local_process_group_test.py
+
+diff --git a/csrc/common/env_vars.h b/csrc/common/env_vars.h
+index 81a281019..b3b4592b6 100644
+--- a/csrc/common/env_vars.h
++++ b/csrc/common/env_vars.h
+@@ -178,6 +178,12 @@ inline constexpr char kTorchTpuInternalUseUnboundedDynamicKernelsEnvVar[] =
+ // via XLA_FLAGS.
+ inline constexpr char kTorchTpuInternalXlaOptionsEnvVar[] =
+     "TORCH_TPU_INTERNAL_XLA_OPTIONS";
++// Comma-separated global device ids of the processes of this process's job, in
++// job-rank order, when several jobs share one TPU slice. Process groups smaller
++// than the slice are then formed among the job's processes only. Unset means
++// one job owns the whole slice.
++inline constexpr char kTorchTpuJobDeviceIdsEnvVar[] =
++    "TORCH_TPU_JOB_DEVICE_IDS";
+ // Similar to CUDA_LAUNCH_BLOCKING, used to enable
+ // EagerMode::kDeferNeverAndLaunchBlocking by default.
+ inline constexpr char kTorchTpuLaunchBlockingEnvVar[] =
+@@ -325,6 +331,7 @@ inline constexpr auto kEnvVarToStage =
+         {kTorchTpuInternalUseUnboundedDynamicKernelsEnvVar,
+          SymbolStage::InternalApi()},
+         {kTorchTpuInternalXlaOptionsEnvVar, SymbolStage::InternalApi()},
++        {kTorchTpuJobDeviceIdsEnvVar, SymbolStage::Experimental()},
+         {kTorchTpuLaunchBlockingEnvVar, SymbolStage::Experimental()},
+         {kTorchTpuProfilerOutputDirEnvVar, SymbolStage::Experimental()},
+         {kTorchTpuSlicebuilderAddressesEnvVar, SymbolStage::Experimental()},
+diff --git a/csrc/distributed/process_group_tpu.cc b/csrc/distributed/process_group_tpu.cc
+index 64f947145..80f7308f3 100644
+--- a/csrc/distributed/process_group_tpu.cc
++++ b/csrc/distributed/process_group_tpu.cc
+@@ -1327,6 +1327,12 @@ struct NodeLocalStoreConfig {
+ // node layout (LOCAL_RANK and TORCH_TPU_DEVICES_PER_HOST) is unknown or the
+ // store is unavailable.
+ absl::StatusOr<NodeLocalStoreConfig> GetNodeLocalStore(int64_t world_size) {
++  // The node-local store expects every device of the host to join each
++  // all-gather under one launcher, which does not hold when the host's devices
++  // are split among jobs.
++  if (GetEnvOnce<kTorchTpuJobDeviceIdsEnvVar>().has_value()) {
++    return NodeLocalStoreConfig{};
++  }
+   const std::optional<int64_t> local_rank =
+       GetIntegerEnvOnce<int64_t, kLocalRankEnvVar>();
+   const std::optional<int64_t> local_world_size =
+@@ -1375,6 +1381,31 @@ absl::StatusOr<NodeLocalStoreConfig> GetNodeLocalStore(int64_t world_size) {
+ }
+ 
+ std::atomic<int64_t> next_subgroup_gather_id{0};
++// Job-local groups count separately: the jobs sharing a slice create different
++// numbers of them, and slice-wide gathers must still get the same id on every
++// process of the slice.
++std::atomic<int64_t> next_job_subgroup_gather_id{0};
++
++// Returns the device ids of TORCH_TPU_JOB_DEVICE_IDS in job-rank order, or an
++// empty list if it is unset.
++absl::StatusOr<DeviceGroup> GetJobDeviceIds() {
++  const std::optional<std::string>& env =
++      GetEnvOnce<kTorchTpuJobDeviceIdsEnvVar>();
++  if (!env.has_value()) {
++    return DeviceGroup();
++  }
++  DeviceGroup ids;
++  absl::flat_hash_set<int64_t> seen;
++  for (std::string_view part : absl::StrSplit(*env, ',')) {
++    int64_t id = 0;
++    TT_RET_CHECK(absl::SimpleAtoi(part, &id) && seen.insert(id).second,
++                 error::kInvalidArgument)
++        << "expected environment variable " << kTorchTpuJobDeviceIdsEnvVar
++        << " to be distinct comma-separated device ids, got '" << *env << "'";
++    ids.push_back(id);
++  }
++  return ids;
++}
+ 
+ }  // namespace
+ 
+@@ -1382,8 +1413,8 @@ absl::Status GatherSubgroupsViaNodeLocalStore(
+     c10d::Store* store, c10d::Store* local_store, int64_t local_rank,
+     int64_t local_world_size, int64_t pg_rank, int64_t pg_size,
+     int64_t world_rank, absl::Span<const int64_t> global_rank_to_device_id,
+-    absl::Span<const int64_t> global_rank_to_topo_order, int64_t gather_id,
+-    DeviceGroup& out_member_world_ranks,
++    absl::Span<const int64_t> global_rank_to_topo_order,
++    std::string_view gather_id, DeviceGroup& out_member_world_ranks,
+     DeviceGroupList& out_subgroup_member_world_ranks) {
+   const UnwrappedStoreChain unwrapped = UnwrapPrefixStoreChain(store);
+   TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=internal store chain invariant
+@@ -1392,12 +1423,12 @@ absl::Status GatherSubgroupsViaNodeLocalStore(
+   const int64_t world_size =
+       static_cast<int64_t>(global_rank_to_device_id.size());
+   const std::string my_key =
+-      absl::StrFormat("pg_sub:%d:%d", gather_id, world_rank);
++      absl::StrFormat("pg_sub:%s:%d", gather_id, world_rank);
+   const std::string my_val =
+       absl::StrFormat("%d,%d:%s", pg_rank, world_rank, unwrapped.full_prefix);
+   std::vector<std::string> peer_keys(world_size);
+   for (int64_t r = 0; r < world_size; ++r) {
+-    peer_keys[r] = absl::StrFormat("pg_sub:%d:%d", gather_id, r);
++    peer_keys[r] = absl::StrFormat("pg_sub:%s:%d", gather_id, r);
+   }
+ 
+   TT_ASSIGN_OR_RETURN(
+@@ -1726,6 +1757,62 @@ absl::StatusOr<DeviceGroupList> ProcessGroupTpu::GatherAllSubgroups(
+   return DeviceGroupList(std::move(unique_subgroups), /*normalize=*/false);
+ }
+ 
++absl::StatusOr<DeviceGroupList> ProcessGroupTpu::GatherJobLocalSubgroups(
++    absl::Span<const int64_t> job_device_ids) {
++  const auto& topo = WorldTopology();
++  const int64_t job_size = job_device_ids.size();
++  TT_RET_CHECK(job_size % size_ == 0, error::kInvalidArgument)
++      << "process group size (" << size_ << ") must divide the job size ("
++      << job_size << ", from " << kTorchTpuJobDeviceIdsEnvVar << ")";
++  // The gather runs in job-rank space: job rank j is the process on device
++  // job_device_ids[j].
++  DeviceGroup job_to_world_rank(job_size);
++  DeviceGroup job_to_topo_order(job_size);
++  int64_t job_rank = -1;
++  for (int64_t j = 0; j < job_size; ++j) {
++    const auto it = absl::c_find(topo.rank_to_device_id, job_device_ids[j]);
++    TT_RET_CHECK(it != topo.rank_to_device_id.end(), error::kInvalidArgument)
++        << kTorchTpuJobDeviceIdsEnvVar << " lists device " << job_device_ids[j]
++        << ", which is not in the slice " << ToString(topo.rank_to_device_id);
++    job_to_world_rank[j] = it - topo.rank_to_device_id.begin();
++    job_to_topo_order[j] = topo.rank_to_topo_order[job_to_world_rank[j]];
++    if (job_device_ids[j] == addressable_device_id_) {
++      job_rank = j;
++    }
++  }
++  TT_RET_CHECK(job_rank >= 0, error::kInvalidArgument)
++      << "this process's device " << addressable_device_id_ << " is not in "
++      << kTorchTpuJobDeviceIdsEnvVar << " " << ToString(job_device_ids);
++
++  // The node-local store is off in jobs (see GetNodeLocalStore), and the key
++  // scope names the job so that jobs sharing a root store do not collide.
++  const std::string gather_id =
++      absl::StrCat("job", job_device_ids[0], ":",
++                   next_job_subgroup_gather_id.fetch_add(1));
++  DeviceGroup member_job_ranks;
++  DeviceGroupList subgroup_job_ranks;
++  TT_RETURN_IF_ERROR(GatherSubgroupsViaNodeLocalStore(
++      store_.get(), /*local_store=*/nullptr, /*local_rank=*/0,
++      /*local_world_size=*/1, rank_, size_, job_rank, job_to_world_rank,
++      job_to_topo_order, gather_id, member_job_ranks, subgroup_job_ranks))
++      << "; with " << kTorchTpuJobDeviceIdsEnvVar
++      << " set, a process group smaller than the slice may hold only this "
++         "job's processes, and its layout must partition the job";
++
++  member_world_ranks_.clear();
++  for (int64_t j : member_job_ranks) {
++    member_world_ranks_.push_back(job_to_world_rank[j]);
++  }
++  std::vector<DeviceGroup> subgroups;
++  for (const DeviceGroup& group : subgroup_job_ranks.groups()) {
++    DeviceGroup& world_group = subgroups.emplace_back();
++    for (int64_t j : group) {
++      world_group.push_back(job_to_world_rank[j]);
++    }
++  }
++  return DeviceGroupList(std::move(subgroups), /*normalize=*/false);
++}
++
+ ProcessGroupTpu::ProcessGroupTpu(c10::intrusive_ptr<c10d::Store> store,
+                                  int rank, int group_size)
+     : c10d::Backend(rank, group_size), store_(std::move(store)) {
+@@ -1759,6 +1846,10 @@ ProcessGroupTpu::ProcessGroupTpu(c10::intrusive_ptr<c10d::Store> store,
+     TT_THROW_IF_ERROR(InitializeRankToDeviceMappings(world_size));
+   }
+   const auto& topo = WorldTopology();
++  // With several jobs on the slice, each job forms its own groups smaller than
++  // the slice (including its default group) without the other jobs taking
++  // part; the slice-sized groups still span every job.
++  TT_ASSIGN_OR_THROW(const DeviceGroup job_device_ids, GetJobDeviceIds());
+   DeviceGroupList subgroup_member_world_ranks;
+   if (is_initial_world_pg) {
+     member_world_ranks_.resize(size_);
+@@ -1786,11 +1877,15 @@ ProcessGroupTpu::ProcessGroupTpu(c10::intrusive_ptr<c10d::Store> store,
+         });
+     subgroup_member_world_ranks =
+         DeviceGroupList(std::move(unique_subgroups), /*normalize=*/false);
++  } else if (!job_device_ids.empty() && size_ < world_size) {
++    TT_ASSIGN_OR_THROW(subgroup_member_world_ranks,
++                       GatherJobLocalSubgroups(job_device_ids));
+   } else if (size_ == world_size ||
+              dynamic_cast<c10d::PrefixStore*>(store_.get()) != nullptr) {
+     TT_ASSIGN_OR_THROW(const NodeLocalStoreConfig local,
+                        GetNodeLocalStore(world_size));
+-    const int64_t gather_id = next_subgroup_gather_id.fetch_add(1);
++    const std::string gather_id =
++        absl::StrCat(next_subgroup_gather_id.fetch_add(1));
+     TT_THROW_IF_ERROR(GatherSubgroupsViaNodeLocalStore(
+         store_.get(), local.store, local.local_rank, local.local_world_size,
+         rank_, size_, topo.world_rank, topo.rank_to_device_id,
+diff --git a/csrc/distributed/process_group_tpu.h b/csrc/distributed/process_group_tpu.h
+index ba3b63899..62ed90787 100644
+--- a/csrc/distributed/process_group_tpu.h
++++ b/csrc/distributed/process_group_tpu.h
+@@ -129,13 +129,14 @@ absl::StatusOr<std::vector<std::vector<uint8_t>>> AllGatherViaNodeLocalStore(
+ // used ONLY to build device_assignment_ and never emitted as replica_groups),
+ // with subgroups sorted by `global_rank_to_topo_order[group[0]]`.
+ // `global_rank_to_topo_order` must have `world_size` entries.
+-// `global_rank_to_device_id` is used only for its size.
++// `global_rank_to_device_id` is used only for its size. `gather_id` scopes the
++// store keys and must be the same on every rank of one gather.
+ absl::Status GatherSubgroupsViaNodeLocalStore(
+     c10d::Store* store, c10d::Store* local_store, int64_t local_rank,
+     int64_t local_world_size, int64_t pg_rank, int64_t pg_size,
+     int64_t world_rank, absl::Span<const int64_t> global_rank_to_device_id,
+-    absl::Span<const int64_t> global_rank_to_topo_order, int64_t gather_id,
+-    DeviceGroup& out_member_world_ranks,
++    absl::Span<const int64_t> global_rank_to_topo_order,
++    std::string_view gather_id, DeviceGroup& out_member_world_ranks,
+     DeviceGroupList& out_subgroup_member_world_ranks);
+ 
+ class ProcessGroupTpu : public c10d::Backend {
+@@ -415,6 +416,13 @@ class ProcessGroupTpu : public c10d::Backend {
+   absl::StatusOr<DeviceGroupList> GatherAllSubgroups(
+       const DeviceGroup& member_world_ranks, int64_t world_size);
+ 
++  // Like GatherSubgroupsViaNodeLocalStore, but only among the processes of the
++  // job on `job_device_ids` (TORCH_TPU_JOB_DEVICE_IDS): sets
++  // member_world_ranks_ and returns this group's layout, whose groups must
++  // partition the job. Other jobs on the slice take no part.
++  absl::StatusOr<DeviceGroupList> GatherJobLocalSubgroups(
++      absl::Span<const int64_t> job_device_ids);
++
+   // Exchanges device attributes across all world ranks and populates the
+   // process-wide world topology. Must be called by a world-sized group.
+   absl::Status InitializeRankToDeviceMappings(int64_t world_size);
+diff --git a/csrc/distributed/process_group_tpu_test.cc b/csrc/distributed/process_group_tpu_test.cc
+index fd6bdbd36..efa0df35d 100644
+--- a/csrc/distributed/process_group_tpu_test.cc
++++ b/csrc/distributed/process_group_tpu_test.cc
+@@ -406,7 +406,7 @@ TEST(ProcessGroupTpuTest, GatherSubgroupsViaNodeLocalStoreCrossNodeSubgroups) {
+           pg_store.get(), rank_local_stores[idx].get(), local_rank,
+           kLocalWorldSize, pg_rank, kPgSize, world_rank,
+           global_rank_to_device_id, global_rank_to_topo_order,
+-          /*gather_id=*/42, out_member_world_ranks[world_rank],
++          /*gather_id=*/"42", out_member_world_ranks[world_rank],
+           out_subgroup_member_world_ranks[world_rank]);
+       EXPECT_TRUE(status.ok()) << status;
+     });
+@@ -508,7 +508,7 @@ TEST(ProcessGroupTpuTest,
+           pg_store.get(), rank_local_stores[idx].get(), local_rank,
+           kLocalWorldSize, pg_rank, kPgSize, world_rank,
+           global_rank_to_device_id, global_rank_to_topo_order,
+-          /*gather_id=*/99, out_member_world_ranks[world_rank],
++          /*gather_id=*/"99", out_member_world_ranks[world_rank],
+           out_subgroup_member_world_ranks[world_rank]);
+       EXPECT_TRUE(status.ok()) << status;
+     });
+diff --git a/docs/distributed_support.md b/docs/distributed_support.md
+index a409192c2..0f071b456 100644
+--- a/docs/distributed_support.md
++++ b/docs/distributed_support.md
+@@ -236,6 +236,37 @@ spawning workers. Note that the default process group encompasses all devices in
+ the
+ [TPU slice](https://cloud.google.com/tpu/docs/system-architecture-tpu-vm#slices).
+ 
++### Several jobs on one slice (experimental)
++
++Two independent jobs, such as an RL trainer and an inference engine, can share
++one TPU slice and still run their own `torch.distributed` worlds. Every process
++starts the TPU runtime for the whole slice (`RANK` and `WORLD_SIZE` of the slice
++and the slice's `TORCH_TPU_SLICEBUILDER_ADDRESSES`), and sets
++`TORCH_TPU_JOB_DEVICE_IDS` to the global device ids of its job's processes, in
++job-rank order (for example `"0,1,2,3"` in one job and `"4,5,6,7"` in the
++other).
++
++1.  Every process of the slice first creates one slice-sized `tpu_dist`
++    backend, `slice_pg`, over a store shared by the slice (with the backend
++    constructor that TorchTPU registers for `tpu_dist`). It defines the slice's
++    ranks and carries transfers between the jobs.
++
++2.  Each job then initializes its own default group with its own ranks:
++    `dist.init_process_group(backend="tpu_dist", store=job_store,
++    rank=job_rank, world_size=job_size)`.
++
++Groups smaller than the slice, including each job's default group, are formed
++among the job's processes only, so each job creates its groups independently of
++the other. As in a single job, every process of a job creates every group of a
++layout, and a layout partitions the job. A group that mixes the jobs' processes
++must span the whole slice. To send tensors between the jobs, call
++`slice_pg.send([tensor], dst_slice_rank, tag)` and `slice_pg.recv(...)`.
++
++Limits: slice-sized groups other than the first, including any collective on
++`slice_pg`, need every process of both jobs, in the same order. With
++`TORCH_TPU_JOB_DEVICE_IDS` set, TorchTPU does not use the node-local store to
++speed up group creation.
++
+ ## Optimal device mesh mapping
+ 
+ To maximize collective bandwidth and minimize latency, align your model's
+diff --git a/docs/public_apis.md b/docs/public_apis.md
+index 89a904fdc..dceaf64a4 100644
+--- a/docs/public_apis.md
++++ b/docs/public_apis.md
+@@ -216,6 +216,7 @@ process. Use it at your own risk. Using it triggers a one-time warning.
+ *   `TORCH_TPU_DEFER_AND_FUSE`
+ *   `TORCH_TPU_DEVICES_PER_HOST`
+ *   `TORCH_TPU_ENABLE_DEBUG_CHECKS`
++*   `TORCH_TPU_JOB_DEVICE_IDS`
+ *   `TORCH_TPU_LAUNCH_BLOCKING`
+ *   `TORCH_TPU_PROFILER_OUTPUT_DIR`
+ *   `TORCH_TPU_SLICEBUILDER_ADDRESSES`
+diff --git a/docs/source/distributed_support.py b/docs/source/distributed_support.py
+index 37f5419fb..1f82ef43b 100644
+--- a/docs/source/distributed_support.py
++++ b/docs/source/distributed_support.py
+@@ -282,6 +282,38 @@ def _(mo):
+     devices in the
+     [TPU slice](https://cloud.google.com/tpu/docs/system-architecture-tpu-vm#slices).
+ 
++    ### Several jobs on one slice (experimental)
++
++    Two independent jobs, such as an RL trainer and an inference engine, can
++    share one TPU slice and still run their own `torch.distributed` worlds.
++    Every process starts the TPU runtime for the whole slice (`RANK` and
++    `WORLD_SIZE` of the slice and the slice's
++    `TORCH_TPU_SLICEBUILDER_ADDRESSES`), and sets `TORCH_TPU_JOB_DEVICE_IDS` to
++    the global device ids of its job's processes, in job-rank order (for
++    example `"0,1,2,3"` in one job and `"4,5,6,7"` in the other).
++
++    1. Every process of the slice first creates one slice-sized `tpu_dist`
++       backend, `slice_pg`, over a store shared by the slice (with the backend
++       constructor that TorchTPU registers for `tpu_dist`). It defines the
++       slice's ranks and carries transfers between the jobs.
++
++    2. Each job then initializes its own default group with its own ranks:
++       `dist.init_process_group(backend="tpu_dist", store=job_store,
++       rank=job_rank, world_size=job_size)`.
++
++    Groups smaller than the slice, including each job's default group, are
++    formed among the job's processes only, so each job creates its groups
++    independently of the other. As in a single job, every process of a job
++    creates every group of a layout, and a layout partitions the job. A group
++    that mixes the jobs' processes must span the whole slice. To send tensors
++    between the jobs, call `slice_pg.send([tensor], dst_slice_rank, tag)` and
++    `slice_pg.recv(...)`.
++
++    Limits: slice-sized groups other than the first, including any collective
++    on `slice_pg`, need every process of both jobs, in the same order. With
++    `TORCH_TPU_JOB_DEVICE_IDS` set, TorchTPU does not use the node-local store
++    to speed up group creation.
++
+     ## Optimal device mesh mapping
+ 
+     To maximize collective bandwidth and minimize latency, align your model's
+diff --git a/tests/api/tt_apis.yaml b/tests/api/tt_apis.yaml
+index bb3aa7b11..ebc20fb89 100644
+--- a/tests/api/tt_apis.yaml
++++ b/tests/api/tt_apis.yaml
+@@ -217,6 +217,7 @@ TORCH_TPU_INTERNAL_SPLIT_RNG_STATE_UPDATE: {category: Environment Variable, defi
+ TORCH_TPU_INTERNAL_STORAGE_AWARE_PLACEHOLDERS: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Internal}
+ TORCH_TPU_INTERNAL_USE_UNBOUNDED_DYNAMIC_KERNELS: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Internal}
+ TORCH_TPU_INTERNAL_XLA_OPTIONS: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Internal}
++TORCH_TPU_JOB_DEVICE_IDS: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Experimental}
+ TORCH_TPU_LAUNCH_BLOCKING: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Experimental}
+ TORCH_TPU_PROFILER_OUTPUT_DIR: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Experimental}
+ TORCH_TPU_SLICEBUILDER_ADDRESSES: {category: Environment Variable, defined_in: csrc/common/env_vars.h, stage: Experimental}
+diff --git a/tests/distributed/BUILD b/tests/distributed/BUILD
+index 3341bac4b..f976b5184 100644
+--- a/tests/distributed/BUILD
++++ b/tests/distributed/BUILD
+@@ -726,6 +726,37 @@ torch_tpu_py_test(
+     ],
+ )
+ 
++torch_tpu_py_test(
++    name = "job_local_process_group_test",
++    timeout = "long",
++    srcs = ["job_local_process_group_test.py"],
++    oss_presubmit_tpu_generation = tpu_gen(
++        "v7",
++        reason = "Two 4-device jobs share one 8-device TPU v7x host",
++    ),
++    tags = if_oss(
++        ["exclusive"],
++        [],
++    ) + [
++        "noasan",  # TODO(b/497035517): fix the test in asan mode.
++        "nomsan",  # TODO(b/497035517): fix the test in msan mode.
++        "notsan",  # TODO(b/497035517): fix the test in tsan mode.
++        "ok-to-wait-for-v7x-in-presubmit",
++        "requires-tpu-v7x:4",
++    ],
++    deps = [
++        ":distributed_utils",
++        "//shims/absl_py/testing:absltest",
++        "//shims/torch:pytorch",
++        "//src/torch_tpu",
++        "//src/torch_tpu/_internal/distributed:multiprocessing",
++        "//src/torch_tpu/_internal/distributed:spmd_util",
++        "//src/torch_tpu/_internal/distributed:tpu_distributed",
++        "//src/torch_tpu/_internal/utils:test_utils",
++        "//tests:seed_test_utils",
++    ],
++)
++
+ torch_tpu_py_test(
+     name = "dtensor_test",
+     srcs = ["dtensor_test.py"],
+diff --git a/tests/distributed/job_local_process_group_test.py b/tests/distributed/job_local_process_group_test.py
+new file mode 100644
+index 000000000..5024c7032
+--- /dev/null
++++ b/tests/distributed/job_local_process_group_test.py
+@@ -0,0 +1,190 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests two jobs that share one TPU slice through TORCH_TPU_JOB_DEVICE_IDS.
++
++Every process starts the TPU runtime for the whole slice and joins one
++slice-sized process group. Each job then runs its own `torch.distributed`
++world on its half of the slice: its default group and subgroups are formed
++among the job's processes only, so the two jobs create different groups in a
++different order. Point-to-point transfers between the jobs use the slice group.
++"""
++
++import datetime
++import os
++import signal
++
++from absl.testing import absltest
++import torch
++from torch import distributed as dist
++import torch.multiprocessing as mp
++from torch_tpu._internal.distributed import multiprocessing
++from torch_tpu._internal.distributed import spmd_util
++from torch_tpu._internal.distributed import tpu_distributed
++from torch_tpu._internal.utils import test_utils as utils
++from tests import seed_test_utils
++from tests.distributed import distributed_utils
++
++_SLICE_SIZE = 8
++_JOB_SIZE = 4
++_TIMEOUT = datetime.timedelta(seconds=120)
++# Groups of each job, as job ranks. Job 0 creates only the pairs; job 1 creates
++# the strided pairs first and then the pairs, so the jobs create a different
++# number of groups in a different order.
++_PAIRS = [[0, 1], [2, 3]]
++_STRIDED = [[0, 2], [1, 3]]
++_LAYOUTS_BY_JOB = ([_PAIRS], [_STRIDED, _PAIRS])
++
++
++def _barrier(store: dist.Store, name: str) -> None:
++  """Blocks until all `_SLICE_SIZE` processes reach the barrier `name`."""
++  if store.add(f"{name}:count", 1) == _SLICE_SIZE:
++    store.set(f"{name}:done", "1")
++  store.wait([f"{name}:done"])
++
++
++def _make_layout(job_rank: int, layout: list[list[int]]):
++  """Creates every group of `layout` on every job rank; returns this rank's."""
++  groups = [dist.new_group(ranks=ranks) for ranks in layout]
++  for ranks, group in zip(layout, groups):
++    if job_rank in ranks:
++      return group, ranks
++  raise AssertionError(f"job rank {job_rank} is in no group of {layout}")
++
++
++def run_two_jobs_on_one_slice() -> None:
++  """Runs a 4-process job on each half of an 8-device slice."""
++  slice_rank = int(os.environ["RANK"])
++  assert int(os.environ["WORLD_SIZE"]) == _SLICE_SIZE
++  signal.alarm(300)  # A hang is the failure mode under test.
++  slice_store = dist.TCPStore(
++      os.environ["MASTER_ADDR"],
++      int(os.environ["MASTER_PORT"]),
++      _SLICE_SIZE,
++      is_master=slice_rank == 0,
++      timeout=_TIMEOUT,
++  )
++  # The jobs are defined by devices, so bring up the TPU to learn this
++  # process's device before creating any process group.
++  torch.zeros(1, device="tpu").cpu()
++  device_id = int(tpu_distributed.global_device_id())
++  job = device_id // _JOB_SIZE
++  job_device_ids = list(range(job * _JOB_SIZE, (job + 1) * _JOB_SIZE))
++  job_rank = job_device_ids.index(device_id)
++  peer_device_id = (device_id + _JOB_SIZE) % _SLICE_SIZE
++  # Read when the first process group is created.
++  os.environ["TORCH_TPU_JOB_DEVICE_IDS"] = ",".join(map(str, job_device_ids))
++
++  # The slice group comes first and defines the slice's world ranks.
++  slice_pg = tpu_distributed.create_process_group(
++      dist.PrefixStore("slice", slice_store),
++      slice_rank,
++      _SLICE_SIZE,
++      _TIMEOUT,
++  )
++  slice_store.set(f"slice_rank_of_device:{device_id}", str(slice_rank))
++
++  # Each job's world. Both jobs share the root store on purpose: their groups
++  # must not collide in it.
++  dist.init_process_group(
++      backend="tpu_dist",
++      store=dist.PrefixStore(f"job{job}", slice_store),
++      rank=job_rank,
++      world_size=_JOB_SIZE,
++      timeout=_TIMEOUT,
++  )
++  assert dist.get_world_size() == _JOB_SIZE
++
++  x = torch.tensor([1.0, float(device_id)], device="tpu")
++  dist.all_reduce(x)
++  utils.assert_close(
++      x.cpu(), torch.tensor([float(_JOB_SIZE), float(sum(job_device_ids))])
++  )
++  gathered = torch.empty(_JOB_SIZE, device="tpu")
++  dist.all_gather_into_tensor(
++      gathered, torch.tensor([float(device_id)], device="tpu")
++  )
++  utils.assert_close(
++      gathered.cpu(), torch.tensor([float(d) for d in job_device_ids])
++  )
++
++  # Group k of a job's last layout runs k + 1 all-reduces; no other job takes
++  # part.
++  group, ranks = None, None
++  for layout in _LAYOUTS_BY_JOB[job]:
++    group, ranks = _make_layout(job_rank, layout)
++  group_index = _PAIRS.index(ranks)
++  y = torch.tensor([float(device_id)], device="tpu")
++  for _ in range(group_index + 1):
++    dist.all_reduce(y, group=group)
++  member_sum = float(sum(job_device_ids[r] for r in ranks))
++  utils.assert_close(
++      y.cpu(), torch.tensor([member_sum * len(ranks) ** group_index])
++  )
++
++  # A program that combines the job's world and a pair runs on the job's
++  # devices, with the pair's all-reduce tiled over the job's pairs.
++  @torch.compile(backend="tpu", fullgraph=True)
++  @spmd_util.spmd_safe
++  def mixed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++    dist.all_reduce(a)
++    dist.all_reduce(b, group=group)
++    return a + b
++
++  utils.assert_close(
++      mixed(torch.ones(4, device="tpu"), torch.ones(4, device="tpu")).cpu(),
++      torch.full((4,), float(_JOB_SIZE + len(ranks))),
++  )
++
++  # Job 0 sends to the process on the same position of job 1 over the slice
++  # group.
++  peer_slice_rank = int(
++      slice_store.get(f"slice_rank_of_device:{peer_device_id}")
++  )
++  if job == 0:
++    payload = torch.full((8, 128), float(device_id), device="tpu")
++    slice_pg.send([payload], peer_slice_rank, 0).wait()
++  else:
++    received = torch.empty((8, 128), device="tpu")
++    slice_pg.recv([received], peer_slice_rank, 0).wait()
++    utils.assert_close(
++        received.cpu(), torch.full((8, 128), float(peer_device_id))
++    )
++
++  # The slice group still runs collectives over every process.
++  z = torch.tensor([float(device_id)], device="tpu")
++  work = slice_pg.allreduce([z], dist.AllreduceOptions())
++  if work is not None:
++    work.wait()
++  utils.assert_close(
++      z.cpu(), torch.tensor([float(sum(range(_SLICE_SIZE)))])
++  )
++
++  torch.accelerator.synchronize()
++  dist.destroy_process_group()
++  # Keep slice rank 0's store server alive until every process is done.
++  _barrier(slice_store, "finished")
++
++
++class JobLocalProcessGroupTest(seed_test_utils.MultiProcessRepeatableTest):
++
++  def test_two_jobs_on_one_slice(self):
++    distributed_utils.dist_run(
++        nproc_per_node=_SLICE_SIZE, fn=run_two_jobs_on_one_slice
++    )
++
++
++if __name__ == "__main__":
++  mp.set_start_method("spawn")
++  multiprocessing.handle_test_main(absltest.main)
+diff --git a/tests/error_coverage_data.yaml b/tests/error_coverage_data.yaml
+index f8a6a22e4..fbbef510b 100644
+--- a/tests/error_coverage_data.yaml
++++ b/tests/error_coverage_data.yaml
+@@ -34,7 +34,7 @@ csrc/common/tier2_compilation_cache.cc: {remaining: 3, total: 3, infeasible: 0}
+ csrc/common/tpu_hardware.cc: {remaining: 0, total: 1, infeasible: 1}
+ csrc/common/unbounded_dynamic_kernel_registry.cc: {remaining: 0, total: 1, infeasible: 1}
+ csrc/common/version.cc: {remaining: 0, total: 2, infeasible: 0}
+-csrc/distributed/process_group_tpu.cc: {remaining: 25, total: 98, infeasible: 36}
++csrc/distributed/process_group_tpu.cc: {remaining: 29, total: 102, infeasible: 36}
+ csrc/distributed/slicebuilder/discovery.cc: {remaining: 4, total: 4, infeasible: 0}
+ csrc/distributed/utils.cc: {remaining: 1, total: 3, infeasible: 0}
+ csrc/distributed/window_tpu.cc: {remaining: 10, total: 12, infeasible: 0}
+-- 
+2.50.1 (Apple Git-155)
+

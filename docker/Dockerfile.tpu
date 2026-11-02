@@ -25,6 +25,8 @@ ARG TORCHTITAN_COMMIT=45e33cd413b64cb37a7840cfd3c9765d3c639ae1
 ARG MILES_COMMIT=main
 ARG WHEELS_REPO=radixark/miles-wheels
 ARG WHEELS_TAG=cu130-torch214-x86_64
+# torch_tpu main + docker/patch/torch_tpu_job_local_process_groups.patch (--update-weight-transfer-mode ici)
+ARG TORCH_TPU_WHEELS_TAG=torch-tpu-f7172418b-job-local
 ARG TARGETARCH
 
 # ====================================== Install sglang-torchtpu ============================================
@@ -42,7 +44,16 @@ RUN SGLANG_VERSION=$(python3 -c 'import importlib.metadata as m; print(m.version
 
 # ====================================== Torch ============================================
 
-# torch_tpu and libtpu stay the release's; the constraints keep every later install on this torch and them
+# torch_tpu with job-local process groups, so a trainer and an engine can share one slice (ICI weight sync); same
+# libtpu as the release. Rebuild: bazel build --config=wheel_release --config=no_rbe //ci/wheel:torch_tpu_wheel on
+# google-pytorch/torch_tpu f7172418b with the patch applied.
+RUN url=$(curl -fsSL "https://api.github.com/repos/${WHEELS_REPO}/releases/tags/${TORCH_TPU_WHEELS_TAG}" \
+    | python3 -c "import json, sys; print(next(a['browser_download_url'] for a in json.load(sys.stdin)['assets'] \
+if a['name'].startswith('torch_tpu-') and a['name'].endswith('.whl')))") && \
+    curl -fsSL -o "/tmp/$(basename "$url")" "$url" && \
+    pip install --no-deps --force-reinstall /tmp/torch_tpu-*.whl && rm /tmp/torch_tpu-*.whl
+
+# torch_tpu and libtpu stay as installed above; the constraints keep every later install on this torch and them
 RUN TORCH_TPU_PIN=$(python3 -c 'import importlib.metadata as m; print(m.version("torch_tpu"))') && \
     LIBTPU_PIN=$(python3 -c 'import importlib.metadata as m; print(m.version("libtpu"))') && \
     printf "torch==${TORCH_VERSION}\ntorchvision==${TORCHVISION_VERSION}\ntorch_tpu==${TORCH_TPU_PIN}\nlibtpu==${LIBTPU_PIN}\ntriton==${TRITON_VERSION}\n" \
