@@ -39,6 +39,7 @@ from miles.utils.arguments import (
     _validate_deploy_component,
     _validate_rematerialize_param_from_master_weight,
     get_miles_extra_args_provider,
+    hf_validate_args,
     miles_validate_args,
     parse_args_and_get_parser,
     resolve_rollout_function_paths,
@@ -4024,3 +4025,34 @@ def test_native_backends_own_the_mtp_detach_heads_argument(
     assert native_args is not None
     assert native_args.mtp_detach_heads is detach_heads
     assert "mtp_detach_heads" not in args.model_fields
+
+
+def _ffn_width_args(**overrides):
+    return SimpleNamespace(
+        model_name="",
+        context_parallel_size=1,
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_layers=6,
+        untie_embeddings_and_output_weights=True,
+        layernorm_epsilon=1e-5,
+        rotary_base=10000.0,
+        **overrides,
+    )
+
+
+def test_minimax_m3_dense_width_naming_does_not_apply_to_inkling():
+    """Both configs name the dense width dense_intermediate_size and the expert width intermediate_size,
+    but only MiniMax-M3's Megatron recipe sizes ffn_hidden_size from the dense width; Inkling's sizes it
+    from intermediate_size, which keying the naming on the key's presence broke."""
+    inkling = SimpleNamespace(
+        model_type="inkling_text", dense_intermediate_size=16384, intermediate_size=2048, hidden_size=1024
+    )
+    hf_validate_args(_ffn_width_args(ffn_hidden_size=2048, moe_ffn_hidden_size=2048), inkling)
+
+    minimax = SimpleNamespace(
+        model_type="minimax_m3_vl_text", dense_intermediate_size=12288, intermediate_size=3072, hidden_size=1024
+    )
+    hf_validate_args(_ffn_width_args(ffn_hidden_size=12288, moe_ffn_hidden_size=3072), minimax)
+    with pytest.raises(AssertionError, match="dense_intermediate_size in hf config 12288"):
+        hf_validate_args(_ffn_width_args(ffn_hidden_size=3072, moe_ffn_hidden_size=3072), minimax)
