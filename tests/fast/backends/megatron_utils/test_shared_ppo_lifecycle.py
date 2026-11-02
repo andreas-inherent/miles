@@ -20,7 +20,7 @@ from miles.ray.train_actor import WeightUpdateOutput
 from miles.utils import object_store
 from miles.utils.dp_schedule import TrainParallelConfig
 from miles.utils.ray_utils import Box
-from miles.utils.replay_base import IndexerReplayManager, RoutingReplayManager
+from miles.utils.replay_base import IndexerReplayManager, Replay, RoutingReplayManager
 from miles.utils.tensor_backper import MainCastContext, TensorBackuper
 
 
@@ -1272,3 +1272,46 @@ def test_actor_weight_getter_forwards_companion_selection_to_live_source(
     if use_tms_backup:
         expected["translate_gpu_to_cpu"] = True
     worker._named_actor_weights.assert_called_once_with(**expected)
+
+
+class _CpuReplay(Replay):
+    def record(self, top_indices):
+        self.top_indices_list.append(top_indices)
+
+    def pop_forward(self):
+        self.forward_index += 1
+        return self.top_indices_list[self.forward_index - 1]
+
+
+def test_reference_forward_replays_rollout_routing_and_rewinds_for_actor(actor_module, monkeypatch):
+    manager = RoutingReplayManager()
+    manager.enabled = True
+    manager.replays = [_CpuReplay()]
+    manager.set_current(manager.replays[0])
+    indexer = IndexerReplayManager()
+    indexer.enabled = True
+    rollout_top_indices = torch.tensor([[0]], dtype=torch.int64)
+    monkeypatch.setattr(
+        actor_module, "fill_replay_data", lambda **kwargs: kwargs["replay_list"][0].record(rollout_top_indices)
+    )
+    worker = _actor_reuse_worker(actor_module, use_rollout_routing_replay=True)
+    worker.weights_backuper.backup_tags = {"ref"}
+    _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
+    monkeypatch.setattr(actor_module, "all_replay_managers", [manager, indexer])
+    del worker._set_replay_stage
+    topk_fn = manager.get_topk_fn(lambda scores, topk: torch.topk(scores, topk, dim=1).indices, return_probs=False)
+    picks = {}
+    indexer_stages = {}
+
+    def forward(*_args, store_prefix, **_kwargs):
+        picks[store_prefix] = topk_fn(torch.tensor([[0.0, 1.0]]), 1)
+        indexer_stages[store_prefix] = indexer.stage
+        return {}
+
+    worker._compute_log_prob.side_effect = forward
+
+    worker._train_actor(7, {"num_rollouts": [1], "total_lengths": [1]}, witness_info=None, attempt=0)
+
+    torch.testing.assert_close(picks["ref_"], rollout_top_indices)
+    torch.testing.assert_close(picks[""], rollout_top_indices)
+    assert indexer_stages == {"ref_": "fallthrough", "": "record"}

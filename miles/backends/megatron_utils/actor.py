@@ -34,6 +34,7 @@ from miles.backends.training_utils.model_companion import (
     ModelCompanionInstallationUtils,
     ModelCompanionWeightVersionUtils,
 )
+from miles.backends.training_utils.replay import routing_replay
 from miles.backends.training_utils.replay.data import fill_replay_data, register_replay_list_sequential
 from miles.backends.training_utils.types import TrainStepOutput
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
@@ -604,8 +605,14 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = target_tag
 
     def _set_replay_stage(self, stage: str) -> None:
+        """Replaying forward falls through on managers that hold no rollout replay."""
         for m in all_replay_managers:
-            m.stage = stage
+            # REPLAY_FORWARD pops from replays that fill_replay_data filled from the rollout. A manager without
+            # rollout replay has nothing to pop, so it falls through and routes freely.
+            # The other stages work on every manager: RECORD saves routing, REPLAY_BACKWARD (training) pops the same
+            # list REPLAY_FORWARD read, or what RECORD saved, and FALLTHROUGH never touches the replays.
+            no_rollout_data = stage == routing_replay.REPLAY_FORWARD and not self._use_rollout_replay(m)
+            m.stage = routing_replay.FALLTHROUGH if no_rollout_data else stage
 
     @with_logs
     def _compute_log_prob(
@@ -765,7 +772,8 @@ class MegatronTrainRayActor(TrainRayActor):
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights_backuper.backup_tags:
-                    self._set_replay_stage("fallthrough")
+                    # The ref replays the rollout's routing like the actor does, so KL measures weights, not routing.
+                    self._set_replay_stage(routing_replay.REPLAY_FORWARD)
                     self._switch_model("ref")
                     rollout_data.update(
                         self._compute_log_prob(
@@ -775,9 +783,12 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
+                    for m in all_replay_managers:
+                        if self._use_rollout_replay(m):
+                            m.clear_all_forward()
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
                 if "teacher" in self.weights_backuper.backup_tags:
-                    self._set_replay_stage("fallthrough")
+                    self._set_replay_stage(routing_replay.FALLTHROUGH)
                     self._switch_model("teacher")
                     rollout_data.update(
                         self._compute_log_prob(
@@ -794,9 +805,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     for m in all_replay_managers:
                         if m.enabled:
                             if self._use_rollout_replay(m):
-                                m.stage = "replay_forward"
+                                m.stage = routing_replay.REPLAY_FORWARD
                             else:
-                                m.stage = "record"
+                                m.stage = routing_replay.RECORD
                     rollout_data.update(
                         self._compute_log_prob(
                             data_iterator,
@@ -836,7 +847,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             # Train
             num_rollouts = get_num_rollouts(self.args, rollout_data, num_optimizer_steps)
-            self._set_replay_stage("replay_backward")
+            self._set_replay_stage(routing_replay.REPLAY_BACKWARD)
             with timer("actor_train"):
                 self._log_first_train_config()
                 train_step_outcome = train(
