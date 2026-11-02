@@ -441,6 +441,11 @@ class SGLangApiClient:
         sessions) and apply the streamed LoRA stash."""
         return await self._make_request("end_weight_update", {"expected_lora_checksums": expected_lora_checksums})
 
+    async def plugin_weight_update(self, handler: str, payload: dict):
+        """Run a weight-update handler the engine's platform registers on every TP rank; the reply's
+        ``results`` holds each rank's return value."""
+        return await self._make_request("plugin_weight_update", {"handler": handler, "payload": payload})
+
     async def update_weight_version(self, weight_version: str, abort_all_requests: bool = False):
         return await self._make_request(
             "update_weight_version",

@@ -18,7 +18,6 @@ from miles.utils.workers.worker_spec import HostAndPort, NamedHostAndPorts
 
 logger = logging.getLogger(__name__)
 
-DISCOVERY_TIMEOUT_SECONDS = 600.0
 
 _EXTERNAL_ENGINE_POOL_ID = "external-inference-engine-0"
 _EXTERNAL_MODEL_ID = "default"
@@ -47,7 +46,11 @@ class StaticInferenceEngineWorkerProvider(BaseWorkerProvider):
 
     async def init(self) -> None:
         urls = _compute_external_engine_urls(self._args)
-        engines = await _discover_external_engines(urls, api_key=self._args.sglang.base_args["api_key"])
+        engines = await _discover_external_engines(
+            urls,
+            api_key=self._args.sglang.base_args["api_key"],
+            timeout_seconds=self._args.rollout_external_engine_discovery_timeout,
+        )
         _assert_engines_match_args(self._args, engines=engines)
 
         self._cells = _compute_cells(args=self._args, engines=engines)
@@ -207,13 +210,19 @@ def _canonicalize_host(hostname: str) -> str:
 # ================================= discovery ==================================
 
 
-async def _discover_external_engines(urls: list[str], *, api_key: str | None) -> list[_ExternalEngineInfo]:
-    return list(await asyncio.gather(*[_discover_external_engine(url, api_key=api_key) for url in urls]))
+async def _discover_external_engines(
+    urls: list[str], *, api_key: str | None, timeout_seconds: float
+) -> list[_ExternalEngineInfo]:
+    return list(
+        await asyncio.gather(
+            *[_discover_external_engine(url, api_key=api_key, timeout_seconds=timeout_seconds) for url in urls]
+        )
+    )
 
 
-async def _discover_external_engine(url: str, *, api_key: str | None) -> _ExternalEngineInfo:
+async def _discover_external_engine(url: str, *, api_key: str | None, timeout_seconds: float) -> _ExternalEngineInfo:
     addr = _parse_external_engine_url(url)
-    server_info = await _fetch_server_info_with_retry(url, api_key=api_key)
+    server_info = await _fetch_server_info_with_retry(url, api_key=api_key, timeout_seconds=timeout_seconds)
 
     return _ExternalEngineInfo(
         url=url,
@@ -227,9 +236,7 @@ async def _discover_external_engine(url: str, *, api_key: str | None) -> _Extern
     )
 
 
-async def _fetch_server_info_with_retry(
-    url: str, *, api_key: str | None, timeout_seconds: float = DISCOVERY_TIMEOUT_SECONDS
-) -> dict[str, Any]:
+async def _fetch_server_info_with_retry(url: str, *, api_key: str | None, timeout_seconds: float) -> dict[str, Any]:
     async def _attempt(_remaining_seconds: float) -> dict[str, Any]:
         return await SGLangApiClient(server_url=url, api_key=api_key).get_server_info()
 

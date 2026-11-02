@@ -24,6 +24,7 @@ from miles.backends.sglang_utils.sglang_config import SglangConfig
 from miles.backends.sglang_utils.sglang_scaling_config import SglangScalingConfig
 from miles.backends.torchtitan_utils.args_namespace import TorchtitanArgsNamespace
 from miles.dashboard.args import validate_dashboard_args
+from miles.platforms.tpu_shared_slice import SHARED_SLICE_ENV, SharedSliceSpec
 from miles.ray.specs.train import external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.rollout.reward_shaping import validate_length_penalty_args
@@ -874,7 +875,7 @@ def miles_validate_args(args):
 
     validate_length_penalty_args(args)
     mode = args.update_weight_transfer_mode
-    if mode not in ("broadcast", "broadcast_packed", "p2p", "disk-delta"):
+    if mode not in ("broadcast", "broadcast_packed", "p2p", "disk-delta", "ici"):
         raise ValueError(f"Unknown --update-weight-transfer-mode {mode!r}")
     if mode == "broadcast_packed" and (args.train_backend != "megatron" or args.colocate):
         raise ValueError("broadcast_packed requires Megatron non-colocated weight transfer")
@@ -1291,6 +1292,16 @@ def miles_validate_args(args):
         )
         assert args.prefill_num_servers is None, "P2P weight transfer mode has not been tested when PD is enabled."
         assert args.lora_rank <= 0, "LoRA weight sync is not supported for p2p (RDMA) weight transfer."
+
+    if args.update_weight_transfer_mode == "ici":
+        assert not args.colocate, "ICI weight transfer is for engines on their own devices; colocate is not supported."
+        assert args.prefill_num_servers is None, "PD is not supported for ICI weight transfer."
+        assert args.lora_rank <= 0, "LoRA weight sync is not supported for ICI weight transfer."
+        # Checked in the driver: a trainer without it never joins the slice, and its engine then waits forever.
+        assert SharedSliceSpec.from_env() is not None, (
+            f"--update-weight-transfer-mode=ici needs {SHARED_SLICE_ENV}: the trainer and its engines share one TPU "
+            "slice"
+        )
 
     if args.update_weight_transfer_mode == "disk-delta":
         assert not args.colocate, (

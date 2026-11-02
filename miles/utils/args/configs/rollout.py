@@ -225,6 +225,16 @@ class RolloutRelatedConfig(BaseConfig):
             ),
         ),
     ] = None
+    rollout_external_engine_discovery_timeout: A[
+        float,
+        Arg(
+            help=(
+                "Seconds to wait for each external engine to answer /server_info. Engines sharing a TPU slice with "
+                "the trainer (--update-weight-transfer-mode ici) finish compiling only after the trainer joins, "
+                "so they need longer."
+            )
+        ),
+    ] = 600.0
     rollout_external_router_pd: A[
         bool,
         Arg(
@@ -251,12 +261,15 @@ class RolloutRelatedConfig(BaseConfig):
         str,
         Arg(
             type_parser=None,
-            choices=["broadcast", "broadcast_packed", "p2p", "disk-delta"],
+            choices=["broadcast", "broadcast_packed", "p2p", "disk-delta", "ici"],
             help=(
                 "The method to transfer weights to remote rollout engines during update weight. "
                 "'disk-delta' diffs each sync against a CPU snapshot of the previous one and publishes "
                 "only the changed bytes to --update-weight-disk-dir; each engine's /pull_weights applies "
-                "them into a host-local checkpoint that the engine reloads from."
+                "them into a host-local checkpoint that the engine reloads from. "
+                "'ici' sends each bucket device to device over the ICI links of a TPU slice the trainer "
+                "shares with its engines (MILES_TPU_SHARED_SLICE / SGLANG_TPU_SHARED_SLICE; see "
+                "miles/platforms/tpu_shared_slice.py)."
             ),
         ),
     ] = "broadcast"

@@ -3,7 +3,7 @@
 import torch
 import torch_tpu  # noqa: F401  registers the tpu device with torch
 
-from miles.platforms import Platform
+from miles.platforms import Platform, tpu_shared_slice
 
 
 class TpuPlatform(Platform):
@@ -22,3 +22,9 @@ class TpuPlatform(Platform):
 
     def device_name(self) -> str | None:
         return None
+
+    def join_shared_slice(self, *, job_rank: int, job_size: int) -> None:
+        spec = tpu_shared_slice.SharedSliceSpec.from_env()
+        if spec is not None:
+            # per-process runtime state, like the bound device: the protocol that sends reads it from here
+            self.shared_slice = tpu_shared_slice.join(spec, job_rank=job_rank, job_size=job_size)

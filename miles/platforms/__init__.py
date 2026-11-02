@@ -5,8 +5,12 @@ Everything `torch.accelerator` covers (synchronize, empty_cache, memory stats, t
 
 import functools
 import os
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from miles.platforms.tpu_shared_slice import SharedSlice
 
 
 class Platform:
@@ -17,6 +21,11 @@ class Platform:
     dynamic_shapes = True
     # NVML sees the devices, so each training rank is pinned to its GPU's NUMA node
     nvml_numa_affinity = True
+    # the device slice this process shares with its rollout engine (--update-weight-transfer-mode ici); TPU only
+    shared_slice: "SharedSlice | None" = None
+
+    def join_shared_slice(self, *, job_rank: int, job_size: int) -> None:
+        """Join a device slice shared with the rollout engine, before the first device op; CUDA has none."""
 
     def bind_device_before_process_group(self, local_rank: int) -> None:
         torch.cuda.set_device(f"cuda:{local_rank}")
