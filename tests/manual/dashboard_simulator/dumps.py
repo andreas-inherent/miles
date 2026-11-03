@@ -178,8 +178,8 @@ def _slice_response_for_cp_rank(
 ) -> torch.Tensor:
     if cp_size == 1:
         return values
-    _, _, logits_offsets, _ = get_logits_and_tokens_offset_with_cp(
+    logits_offsets = get_logits_and_tokens_offset_with_cp(
         total_length, response_length, "thd", None, cp_rank=cp_rank, cp_size=cp_size
-    )
+    ).logits
     first_logit = total_length - response_length - 1
     return torch.cat([values[start - first_logit : end - first_logit] for start, end in logits_offsets])

@@ -10,6 +10,20 @@ from miles.backends.training_utils.parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
 
+_Span = tuple[int, int]
+
+
+class CPOffsets(NamedTuple):
+    """One CP rank's two zigzag halves of a sample, as half-open spans from the start of the prompt.
+
+    A named tuple, so callers that unpack the former 4-tuple keep working.
+    """
+
+    chunk_size: int
+    chunks: tuple[_Span, _Span]  # the sequence positions this rank holds
+    logits: tuple[_Span, _Span]  # the rows whose logits score a response token; (0, 0) when a half has none
+    tokens: tuple[_Span, _Span]  # the response tokens those rows score, one position after `logits`
+
 
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
@@ -18,7 +32,7 @@ def get_logits_and_tokens_offset_with_cp(
     max_seq_len: int | None = None,
     cp_rank: int | None = None,
     cp_size: int | None = None,
-):
+) -> CPOffsets:
     """
     All offsets start from the begining of the prompt.
 
@@ -59,7 +73,9 @@ def get_logits_and_tokens_offset_with_cp(
         logits_1 = (0, 0)
         token_1 = (0, 0)
 
-    return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
+    return CPOffsets(
+        chunk_size=chunk_size, chunks=(chunk_0, chunk_1), logits=(logits_0, logits_1), tokens=(token_0, token_1)
+    )
 
 
 class LocalResponseRows(NamedTuple):
@@ -185,23 +201,21 @@ def _response_rows_zigzag_cp(
     tokens, *, slot_start, total_length, response_length, qkv_format, max_seq_len, include_response_indices
 ) -> tuple[LocalResponseRows, int]:
     """Two runs, one per zigzag half, and the number of local rows the sample's slot takes."""
-    chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, qkv_format, max_seq_len
-    )
+    offsets = get_logits_and_tokens_offset_with_cp(total_length, response_length, qkv_format, max_seq_len)
     row_ranges = tuple(
-        _zigzag_half_rows(half_start, logits_offset[half], chunks_offset[half][0])
-        for half, half_start in enumerate((slot_start, slot_start + chunk_size))
+        _zigzag_half_rows(half_start, offsets.logits[half], offsets.chunks[half][0])
+        for half, half_start in enumerate((slot_start, slot_start + offsets.chunk_size))
     )
-    token_halves = [tokens[start:end] for start, end in tokens_offset]
+    token_halves = [tokens[start:end] for start, end in offsets.tokens]
     for (row_start, row_end), token_half in zip(row_ranges, token_halves, strict=True):
         assert row_end - row_start == token_half.size(0), f"{row_end - row_start} vs {token_half.size(0)}"
     prompt_length = total_length - response_length
     response_indices = (
-        [index - prompt_length for start, end in tokens_offset for index in range(start, end)]
+        [index - prompt_length for start, end in offsets.tokens for index in range(start, end)]
         if include_response_indices
         else ()
     )
-    return LocalResponseRows(row_ranges, torch.cat(token_halves, dim=0), response_indices), 2 * chunk_size
+    return LocalResponseRows(row_ranges, torch.cat(token_halves, dim=0), response_indices), 2 * offsets.chunk_size
 
 
 def _zigzag_half_rows(half_start: int, logits_range: tuple[int, int], chunk_start: int) -> tuple[int, int]:
@@ -225,9 +239,7 @@ def _slice_loss_mask_for_local_cp(
 ) -> torch.Tensor:
     """Slice a per-sample response loss mask into this CP rank's local zigzag layout."""
     prompt_length = total_length - response_length
-    _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, qkv_format, max_seq_len
-    )
+    tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, qkv_format, max_seq_len).tokens
     mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
     mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
     return torch.cat([mask_0, mask_1], dim=0)
@@ -359,9 +371,7 @@ def all_gather_with_cp(
     if cp_size == 1:
         return tensor
 
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, qkv_format, max_seq_len
-    )
+    logits_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length, qkv_format, max_seq_len).logits
 
     prompt_length = total_length - response_length
 
@@ -578,9 +588,9 @@ def slice_log_prob_with_cp(
         return log_prob
 
     prompt_length = total_length - response_length
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+    logits_offset = get_logits_and_tokens_offset_with_cp(
         total_length, response_length, qkv_format, max_token_len
-    )
+    ).logits
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
     chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]
@@ -611,9 +621,9 @@ def assemble_log_prob_from_cp(
     prompt_length = total_length - response_length
     out = torch.zeros(response_length, dtype=next(iter(chunks.values())).dtype)
     for cp_rank, chunk in chunks.items():
-        _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+        logits_offset = get_logits_and_tokens_offset_with_cp(
             total_length, response_length, qkv_format, max_seq_len, cp_rank=cp_rank, cp_size=cp_size
-        )
+        ).logits
         taken = 0
         for lo, hi in logits_offset:
             start, stop = lo - (prompt_length - 1), hi - (prompt_length - 1)

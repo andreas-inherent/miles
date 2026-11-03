@@ -139,9 +139,9 @@ def normalize_advantages(
         ):
             prompt_len = total_len - response_len
 
-            _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(
+            token_offsets = get_logits_and_tokens_offset_with_cp(
                 total_len, response_len, args.qkv_format, max_seq_len
-            )
+            ).tokens
 
             # Convert global offsets to response-space offsets
             (s0, e0), (s1, e1) = token_offsets

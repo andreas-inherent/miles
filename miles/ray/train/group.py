@@ -3,7 +3,7 @@ import logging
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -55,6 +55,15 @@ logger = logging.getLogger(__name__)
 
 _RETRY_MAX_ATTEMPTS = 30
 _CELLS_READY_TIMEOUT_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class _AttemptOutcomes:
+    """The cell indices of one train attempt's alive cells, bucketed by how their step ended."""
+
+    errored: list[int]
+    discarded: list[int]
+    normal: list[int]
 
 
 def compute_trainer_health_checker_config(args: TrainerConfig) -> SimpleHealthCheckerConfig | None:
@@ -282,14 +291,14 @@ class TrainerController:
 
     def _check_train_one_attempt(self, snapshot_alive_cells, results):
         outcomes = TrainerController._compute_attempt_outcomes(snapshot_alive_cells, results)
-        if not outcomes["normal"] and not outcomes["discarded"]:
+        if not outcomes.normal and not outcomes.discarded:
             cause = _first_exception(results)
             error = self._make_all_cells_failed_error("All cells failed in this training attempt", cause=cause)
             log_structured(
                 logger.error,
                 tag="ft",
                 op="check",
-                **outcomes,
+                **asdict(outcomes),
                 decision="give_up" if isinstance(error, NonRetryableError) else "retry",
                 reason="all alive cells failed",
             )
@@ -297,12 +306,12 @@ class TrainerController:
 
         # NOTE: If some cells errors + all other cells claim normal, we do *not* retry
         #       This may happen when some cells fails *after* exchanging gradients w/ others
-        if outcomes["discarded"]:
+        if outcomes.discarded:
             log_structured(
                 logger.warning,
                 tag="ft",
                 op="check",
-                **outcomes,
+                **asdict(outcomes),
                 decision="retry" if self._is_recoverable() else "give_up",
                 reason="discarded_should_retry",
             )
@@ -312,13 +321,13 @@ class TrainerController:
             logger.info,
             tag="ft",
             op="check",
-            **outcomes,
+            **asdict(outcomes),
             decision="no_retry",
             reason="survivors normal, gradients valid",
         )
 
     @staticmethod
-    def _compute_attempt_outcomes(snapshot_alive_cells, results) -> dict[str, list[int]]:
+    def _compute_attempt_outcomes(snapshot_alive_cells, results) -> _AttemptOutcomes:
         paired = list(zip(snapshot_alive_cells, results, strict=True))
         errored = [c.cell_index for c, r in paired if isinstance(r, BaseException)]
         discarded = [
@@ -328,7 +337,7 @@ class TrainerController:
             and any(o.outcome == TrainStepOutcome.DISCARDED_SHOULD_RETRY for o in r)
         ]
         normal = [c.cell_index for c, r in paired if c.cell_index not in errored and c.cell_index not in discarded]
-        return {"errored": errored, "discarded": discarded, "normal": normal}
+        return _AttemptOutcomes(errored=errored, discarded=discarded, normal=normal)
 
     # ------------------------ API :: others ------------------------
 

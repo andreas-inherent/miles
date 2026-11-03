@@ -1,10 +1,13 @@
 from argparse import Namespace
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from miles.backends.training_utils.weight_update.protocols.delta import UpdateWeightFromDiskDelta
+from miles.utils.disk_delta import checksum
 
 _DELTA_MODULE = "miles.backends.training_utils.weight_update.protocols.delta"
 
@@ -40,6 +43,55 @@ class TestPostWriteHookConstruction:
 
         load_function.assert_called_once_with("miles_plugins.example:upload_delta")
         assert protocol._post_write_hook is hook
+
+
+class TestDiffAndCompress:
+    @staticmethod
+    def _make_protocol(tmp_path: Path) -> UpdateWeightFromDiskDelta:
+        protocol = UpdateWeightFromDiskDelta(
+            Namespace(
+                update_weight_disk_dir=str(tmp_path / "delta"),
+                update_weight_delta_encoding="xor",
+                update_weight_delta_checksum="adler32",
+                custom_update_weight_post_write_path=None,
+            )
+        )
+        protocol._snapshot = {"weight": np.array([0, 1, 2, 3], dtype=np.uint8)}
+        return protocol
+
+    def test_an_unchanged_tensor_carries_no_delta(self, tmp_path: Path) -> None:
+        """Identical bytes still become the next snapshot, but leave nothing to compress or checksum."""
+        new = np.array([0, 1, 2, 3], dtype=np.uint8)
+
+        diff = self._make_protocol(tmp_path)._diff_and_compress("weight", new, new.size, False)
+
+        assert diff.name == "weight" and diff.new is new and diff.changed == 0
+        assert diff.compressed is None and diff.checksum is None
+
+    def test_a_changed_tensor_carries_its_compressed_diff_and_checksum(self, tmp_path: Path) -> None:
+        """The changed byte count, the compressed XOR diff and the new bytes' checksum travel together."""
+        new = np.array([0, 1, 7, 9], dtype=np.uint8)
+
+        diff = self._make_protocol(tmp_path)._diff_and_compress("weight", new, new.size, False)
+
+        assert (diff.name, diff.changed) == ("weight", 2)
+        assert diff.compressed is not None and diff.checksum is not None
+
+    def test_collect_files_each_part_of_a_changed_tensor_under_its_name(self, tmp_path: Path) -> None:
+        """The new bytes become the snapshot, and the compressed diff and checksum land in their own maps."""
+        protocol = self._make_protocol(tmp_path)
+        protocol._delta, protocol._checksums, protocol.changed_bytes = {}, {}, 0
+        new = np.array([0, 1, 7, 9], dtype=np.uint8)
+        diff = protocol._diff_and_compress("weight", new, new.size, False)
+        future = Future()
+        future.set_result(diff)
+
+        protocol._collect(future)
+
+        assert protocol._snapshot["weight"] is new
+        assert protocol._delta == {"weight": diff.compressed}
+        assert protocol._checksums == {"weight": checksum("adler32", new)}
+        assert protocol.changed_bytes == 2
 
 
 class TestReloadEnginesFailureTransitions:

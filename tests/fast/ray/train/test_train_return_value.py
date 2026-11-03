@@ -122,8 +122,8 @@ class TestWorkerResultShape:
 
         outcomes = TrainerController._compute_attempt_outcomes([cell], [results])
 
-        assert outcomes["discarded"] == [0]
-        assert outcomes["normal"] == []
+        assert outcomes.discarded == [0]
+        assert outcomes.normal == []
 
     async def test_a_discarded_outcome_makes_the_group_retry_the_step(self):
         """A worker asking for a retry must cost a whole extra train attempt, not be silently accepted."""

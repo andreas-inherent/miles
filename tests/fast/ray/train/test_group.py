@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ import miles.ray.train.group as group_module
 import miles.utils.test_utils.fault_injector.controller as fault_hook_module
 from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
 from miles.ray.rollout.inference_controller import UpdatableEngines
-from miles.ray.train.group import TrainerController, compute_trainer_health_checker_config
+from miles.ray.train.group import TrainerController, _AttemptOutcomes, compute_trainer_health_checker_config
 from miles.ray.train.init_request import TrainerControllerInitRequest
 from miles.ray.train_actor import WeightUpdateOutput
 from miles.utils import object_store
@@ -1093,13 +1094,22 @@ class TestCheckTrainOneAttempt:
         """_compute_attempt_outcomes buckets each alive cell into errored / discarded / normal by index."""
         results = [_ERR, [DISCARDED], [NORMAL, NORMAL]]
         outcomes = TrainerController._compute_attempt_outcomes(_alive_cells_for(results), results)
-        assert outcomes == {"errored": [0], "discarded": [1], "normal": [2]}
+        assert outcomes == _AttemptOutcomes(errored=[0], discarded=[1], normal=[2])
+
+    def test_the_retry_log_names_each_bucket_of_cell_indices(self, caplog: pytest.LogCaptureFixture):
+        """The ft check log carries one logfmt field per bucket, in errored / discarded / normal order."""
+        results = [_ERR, [DISCARDED], [NORMAL, NORMAL]]
+
+        with caplog.at_level(logging.WARNING, logger="miles.ray.train.group"), pytest.raises(ValueError):
+            _make_controller(num_cells=1)._check_train_one_attempt(_alive_cells_for(results), results)
+
+        assert any("op=check errored=0 discarded=1 normal=2 decision=" in record.message for record in caplog.records)
 
     def test_a_payload_carrying_output_is_bucketed_by_its_outcome(self):
         """The critic ships values alongside its outcome, so the payload must not hide a retry request."""
         results = [[TrainStepOutput(outcome=TrainStepOutcome.DISCARDED_SHOULD_RETRY, values=Box("ref"))]]
         outcomes = TrainerController._compute_attempt_outcomes(_alive_cells_for(results), results)
-        assert outcomes == {"errored": [], "discarded": [0], "normal": []}
+        assert outcomes == _AttemptOutcomes(errored=[], discarded=[0], normal=[])
 
 
 async def _set_all_train_return(group: TrainerController, value: TrainStepOutput) -> None:

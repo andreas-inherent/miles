@@ -9,6 +9,7 @@ from argparse import Namespace
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 import safetensors.numpy
@@ -63,6 +64,17 @@ _SAFETENSORS_DTYPE_BY_TORCH_DTYPE = {
         )  # config-access-exempt: attribute selected at runtime from torch_dtype_name
     },
 }
+
+
+@dataclass(frozen=True)
+class _TensorDiff:
+    """One tensor's bytes diffed against the snapshot; `compressed` and `checksum` are None when nothing changed."""
+
+    name: str
+    new: np.ndarray  # the tensor's new bytes, the next snapshot
+    changed: int  # number of changed bytes
+    compressed: np.ndarray | None = None
+    checksum: str | None = None
 
 
 def _safetensors_dtype(dtype: torch.dtype) -> str:
@@ -276,7 +288,7 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
         self._pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
         self._inflight: deque = deque()
 
-    def _diff_and_compress(self, name, buf, nbytes, pinned):
+    def _diff_and_compress(self, name, buf, nbytes, pinned) -> _TensorDiff:
         if pinned:  # copy out and free the pinned buffer before the heavy diff/compress
             new = np.empty(nbytes, dtype=np.uint8)
             np.copyto(new, buf.numpy()[:nbytes])
@@ -294,17 +306,23 @@ class UpdateWeightFromDiskDelta(WeightTransferProtocol):
         else:
             raise ValueError(f"unknown delta encoding {self.delta_encoding!r}")
         if not changed:
-            return name, new, None, None, 0
+            return _TensorDiff(name=name, new=new, changed=0)
         compressed = np.frombuffer(zstandard.ZstdCompressor(level=1).compress(diff), dtype=np.uint8)
-        return name, new, compressed, checksum(self.checksum_algorithm, new), changed
+        return _TensorDiff(
+            name=name,
+            new=new,
+            changed=changed,
+            compressed=compressed,
+            checksum=checksum(self.checksum_algorithm, new),
+        )
 
     def _collect(self, fut):
-        name, new, compressed, digest, changed = fut.result()
-        self._snapshot[name] = new  # becomes the next sync's base
-        if changed:
-            self.changed_bytes += changed
-            self._delta[name] = compressed
-            self._checksums[name] = digest
+        diff = fut.result()
+        self._snapshot[diff.name] = diff.new  # becomes the next sync's base
+        if diff.changed:
+            self.changed_bytes += diff.changed
+            self._delta[diff.name] = diff.compressed
+            self._checksums[diff.name] = diff.checksum
 
     def _drop_duplicate_names(self, group, world: int, rank: int) -> None:
         """A parameter Megatron replicates across PP stages — the word embedding on the last stage

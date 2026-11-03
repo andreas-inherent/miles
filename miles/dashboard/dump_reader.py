@@ -259,9 +259,9 @@ def _cp_widths_match(widths: list[int], total_length: int, response_length: int,
     if sum(widths) != response_length:
         return False
     for cp_rank, width in enumerate(widths):
-        _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+        logits_offset = get_logits_and_tokens_offset_with_cp(
             total_length, response_length, "thd", None, cp_rank=cp_rank, cp_size=cp_size
-        )
+        ).logits
         if sum(max(0, hi - lo) for lo, hi in logits_offset) != width:
             return False
     return True

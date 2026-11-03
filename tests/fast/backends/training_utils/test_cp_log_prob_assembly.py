@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from miles.backends.training_utils.data.context_parallel import (
+    CPOffsets,
     assemble_log_prob_from_cp,
     get_logits_and_tokens_offset_with_cp,
 )
@@ -21,12 +22,25 @@ def _split(
     prompt_length = total_length - response_length
     chunks = {}
     for cp_rank in range(cp_size):
-        _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+        logits_offset = get_logits_and_tokens_offset_with_cp(
             total_length, response_length, qkv_format, max_seq_len, cp_rank=cp_rank, cp_size=cp_size
-        )
+        ).logits
         parts = [values[lo - (prompt_length - 1) : hi - (prompt_length - 1)] for lo, hi in logits_offset]
         chunks[cp_rank] = torch.cat(parts, dim=0)
     return chunks
+
+
+def test_offsets_name_each_zigzag_half_of_a_rank():
+    """A 10-token sample with a 4-token prompt over cp_size=2: rank 1 holds the whole response, rank 0 none of it."""
+    holding = get_logits_and_tokens_offset_with_cp(10, 6, cp_rank=1, cp_size=2)
+    empty = get_logits_and_tokens_offset_with_cp(10, 6, cp_rank=0, cp_size=2)
+
+    assert holding == CPOffsets(
+        chunk_size=3, chunks=((3, 6), (6, 9)), logits=((3, 6), (6, 9)), tokens=((4, 7), (7, 10))
+    )
+    _, _, logits, _ = holding
+    assert logits == holding.logits
+    assert empty == CPOffsets(chunk_size=3, chunks=((0, 3), (9, 12)), logits=((0, 0), (0, 0)), tokens=((0, 0), (0, 0)))
 
 
 @pytest.mark.parametrize("cp_size", [2, 4, 8])

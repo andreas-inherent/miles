@@ -6,7 +6,7 @@ import ray
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_alive_cell, make_cell
 
 from miles.backends.training_utils.types import TrainStepOutcome
-from miles.ray.train.group import TrainerController
+from miles.ray.train.group import TrainerController, _AttemptOutcomes
 from miles.utils import object_store
 from miles.utils.data import RolloutDataPack
 from miles.utils.ft_utils.health_checker import ActivenessTracker
@@ -256,7 +256,7 @@ class TestTerminalDecisionLogging:
         monkeypatch.setattr(
             TrainerController,
             "_compute_attempt_outcomes",
-            staticmethod(lambda cells, results: {"normal": [], "discarded": [0], "errored": []}),
+            staticmethod(lambda cells, results: _AttemptOutcomes(errored=[], discarded=[0], normal=[])),
         )
 
         with caplog.at_level(logging.WARNING, logger="miles.ray.train.group"), pytest.raises(ValueError):
