@@ -305,7 +305,8 @@ def resolve_hf_lora_targets(hf_config: dict, *, target_modules: list[str] | None
 
 
 def expand_packed_hf_lora_targets(targets: list[str], modules: list[str]) -> list[str]:
-    added, replaced = [], set()
+    added: list[str] = []
+    replaced: set[str] = set()
     for gate in targets:
         if gate.rsplit(".", 1)[-1] != "gate_proj":
             continue

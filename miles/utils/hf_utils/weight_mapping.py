@@ -78,7 +78,7 @@ def get_checkpoint_weight_map(checkpoint_dir: str | Path) -> dict[str, str]:
         with index_path.open(encoding="utf-8") as index_file:
             return json.load(index_file)["weight_map"]
 
-    weight_map = {}
+    weight_map: dict[str, str] = {}
     for shard in sorted(source.glob("*.safetensors")):
         with safe_open(shard, framework="pt", device="cpu") as tensors:
             for name in tensors.keys():

@@ -51,7 +51,9 @@ def assign_rollout_engine_ranks_for_data_replica(
         for rollout_engine_ind, gpu_count in enumerate(engine_gpu_counts)
         for rollout_engine_rank in range(gpu_count)
     ]
-    rollout_engine_indices_by_data_replica = [defaultdict(list) for _ in range(data_replica_size)]
+    rollout_engine_indices_by_data_replica: list[defaultdict[int, list[int]]] = [
+        defaultdict(list) for _ in range(data_replica_size)
+    ]
     for data_replica, (rollout_engine_ind, rollout_engine_rank) in zip(
         range(data_replica_size), targets, strict=False
     ):

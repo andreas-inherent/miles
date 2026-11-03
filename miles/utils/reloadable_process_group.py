@@ -1,6 +1,7 @@
 import logging
 import os
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -9,7 +10,7 @@ from miles.utils.memory_utils import print_memory
 
 logger = logging.getLogger(__name__)
 
-old_new_group_dict = {}
+old_new_group_dict: dict[int, Any] = {}
 
 
 def monkey_patch_torch_dist():
@@ -109,7 +110,7 @@ def monkey_patch_torch_dist():
 
 
 class ReloadableProcessGroup(torch.distributed.ProcessGroup):
-    GROUPS = {}
+    GROUPS: dict[int, list["ReloadableProcessGroup"]] = {}
 
     def __init__(self, group, inner_args, inner_kwargs):
         super().__init__(

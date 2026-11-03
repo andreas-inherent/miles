@@ -51,6 +51,14 @@ repos:
         name: Format code
         additional_dependencies: ['click==8.0.2']
 
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.4.0
+    hooks:
+      - id: mypy
+        args: []  # settings live in pyproject.toml [tool.mypy]
+        pass_filenames: false  # check the whole package, so a change is checked against the modules it affects
+        files: ^miles(_plugins)?/
+
   - repo: local
     hooks:
       - id: sync-example-docs

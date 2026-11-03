@@ -294,7 +294,7 @@ class SGLangApiClient:
             {"lora_name": lora_name, "config_dict": config_dict, "pinned": pinned},
         )
 
-    async def release_memory_occupation(self, tags: list[str] = None):
+    async def release_memory_occupation(self, tags: list[str] | None = None):
         """Release memory occupation. Available tags: weights, kv_cache."""
         await self.flush_cache()
         return await self._make_request(
@@ -302,7 +302,7 @@ class SGLangApiClient:
             {"tags": tags},
         )
 
-    async def resume_memory_occupation(self, tags: list[str] = None):
+    async def resume_memory_occupation(self, tags: list[str] | None = None):
         """
         Available tags for multi-stage resume: weights, kv_cache
         """

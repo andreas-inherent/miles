@@ -45,7 +45,7 @@ class RolloutSamplingMask:
                 response position ``t``. SGLang's ``output_token_sampling_mask``
                 arrives in this shape.
         """
-        ids = []
+        ids: list[int] = []
         offsets = [0]
         for mask in mask_list:
             ids.extend(mask)

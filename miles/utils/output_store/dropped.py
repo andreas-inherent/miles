@@ -21,7 +21,7 @@ _dropped: dict[str, StoreRef] = {}
 
 def store_refs_of(samples: Iterable[Any]) -> dict[str, StoreRef]:
     """Every output store ref the samples own, by key; groups may nest samples in lists."""
-    refs = {}
+    refs: dict[str, StoreRef] = {}
     for item in samples:
         if isinstance(item, Sample):
             if (plan := item.rollout_store_plan) is not None:

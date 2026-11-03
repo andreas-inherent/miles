@@ -34,7 +34,7 @@ def _tower_keys_by_shard(hf_checkpoint: str) -> dict[str, list[str]]:
 
 @functools.cache
 def _load_towers(hf_checkpoint: str) -> tuple[tuple[str, torch.Tensor], ...]:
-    towers = []
+    towers: list[tuple[str, torch.Tensor]] = []
     for shard, keys in sorted(_tower_keys_by_shard(hf_checkpoint).items()):
         with safe_open(os.path.join(hf_checkpoint, shard), framework="pt", device="cpu") as f:
             towers.extend((key, f.get_tensor(key)) for key in sorted(keys))

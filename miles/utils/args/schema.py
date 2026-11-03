@@ -3,7 +3,8 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from types import UnionType
-from typing import Annotated, Any, TypeVar, Union, get_args, get_origin
+from typing import Annotated as A  # noqa: F401  re-exported: config fields are A[type, Arg(...)]
+from typing import Any, TypeVar, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict
 from pydantic.fields import FieldInfo
@@ -12,7 +13,6 @@ from typing_extensions import Self
 from miles.utils.pydantic_utils import StrictBaseModel
 
 _ConfigT = TypeVar("_ConfigT", bound=BaseModel)
-A = Annotated
 
 
 _UNSET = object()

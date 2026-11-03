@@ -88,7 +88,7 @@ class SingletonMeta(type):
     A metaclass for creating singleton classes.
     """
 
-    _instances = {}
+    _instances: dict[type, Any] = {}
 
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:
         if cls not in cls._instances:

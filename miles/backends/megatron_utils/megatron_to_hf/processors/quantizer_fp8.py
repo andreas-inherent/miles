@@ -130,7 +130,7 @@ def _build_layer_skip_predicate(
 ) -> Callable[[str], bool]:
     """Matching a prefix against the checkpoint's ignore list costs one pass over it, and every sync asks again for
     the same prefixes, so each decision is made once per quantization config."""
-    ignored_layers = []
+    ignored_layers: list[str] = []
     for name in ignored_names:
         name = name.removeprefix("model.")
         ignored_layers.extend((name, f"model.{name}"))

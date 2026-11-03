@@ -132,7 +132,7 @@ def call_processor(processor, text, multimodal_inputs: dict | None = None):
 
     # for kimi-vl & kimi-2.5
     if processor_requires_medias(processor):
-        medias = []
+        medias: list[dict[str, Any]] = []
         if images := multimodal_inputs.get("images"):
             medias.extend({"type": "image", "image": image} for image in images)
         if videos := multimodal_inputs.get("videos"):
