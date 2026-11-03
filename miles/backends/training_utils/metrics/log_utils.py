@@ -274,15 +274,14 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 and "rollout/log_probs" in reduced_log_dict
                 and "rollout/ref_log_probs" in reduced_log_dict
             ):
-                # When R3 (rollout routing replay) is enabled, ref model does not use R3
-                # so log_probs and ref_log_probs may diverge; use a relaxed tolerance.
+                # Megatron's ref replays the rollout's routing like the actor, so only the torch_native refs
+                # (separate models without replay hooks) need the relaxed R3 tolerance.
                 # When --sglang-config deploys multiple models, the heavier offload/onload
                 # cycle can amplify flash-attention non-determinism; use 1e-8.
                 # The default branch also covers larger TP/CP/EP variants (e.g. stage-c-long
                 # test_qwen2.5_0.5B_gsm8k.py on 8 GPUs hit ~3.7e-9 diff in CI), so use 1e-8
                 # rather than the previous 3e-9 to absorb BF16 reduction noise across configs.
-                if args.use_rollout_routing_replay:
-                    # lop diff w/ w/o r3 is very big
+                if args.use_rollout_routing_replay and args.train_backend != "megatron":
                     abs_tol = 5e-3
                 else:
                     abs_tol = 1e-8
