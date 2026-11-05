@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -10,7 +9,9 @@ import pybase64
 import pytest
 from tests.ci.ci_register import register_cpu_ci
 from tests.fast.fixtures.generation_fixtures import GenerateEnv, generation_env, listify, make_sample, run_generate
+from tests.fast.ray.rollout.conftest import make_args
 
+from miles.ray.rollout.train_data_conversion import convert_samples_to_train_data
 from miles.rollout.session.types import SessionServerInstance
 from miles.utils.chat_template_utils import TITOTokenizerType, get_tito_tokenizer
 from miles.utils.function_registry import function_registry
@@ -687,6 +688,47 @@ class TestRoutedExpertsMultiTurn:
         np.testing.assert_array_equal(sample.rollout_routed_experts, second_routed_experts)
         assert len(sample.tokens) - 1 == second_routed_experts.shape[0]
 
+    @pytest.mark.parametrize(
+        "generation_env",
+        [{"args_kwargs": {"use_rollout_routing_replay": True, "num_layers": 2, "generate_max_turns": 1}}],
+        indirect=True,
+    )
+    # The agentic variant's session records no observation after the last turn.
+    @pytest.mark.parametrize("variant", ["multi_turn"])
+    def test_turn_limit_after_a_tool_call_pads_the_observation_rows(self, variant, generation_env):
+        S = TwoTurnStub
+        num_layers, moe_router_topk = generation_env.args.num_layers, 4
+        rows = len(S.FIRST_PROMPT_TOKEN_IDS) + token_len(S.FIRST_RESPONSE) - 1
+        routed_experts = np.arange(1, rows * num_layers * moe_router_topk + 1, dtype=np.int32).reshape(
+            rows, num_layers, moe_router_topk
+        )
+        generation_env.mock_server.process_fn = lambda _: ProcessResult(
+            text=S.FIRST_RESPONSE,
+            finish_reason="stop",
+            meta_info=ProcessResultMetaInfo(
+                routed_experts=pybase64.b64encode(routed_experts.tobytes()).decode("ascii")
+            ),
+        )
+
+        sample = _run_generate(variant, generation_env, make_sample(prompt=S.PROMPT)).sample
+
+        # The rollout ends on the tool observation, which no forward ran.
+        observation = token_len(S.FIRST_TOOL_RESPONSE)
+        assert sample.rollout_routed_experts.shape == (len(sample.tokens) - 1, num_layers, moe_router_topk)
+        np.testing.assert_array_equal(sample.rollout_routed_experts[:rows], routed_experts)
+        assert (sample.rollout_routed_experts[rows:] == -1).all() and len(
+            sample.rollout_routed_experts
+        ) - rows == observation
+        sample.reward = 1.0
+        out = convert_samples_to_train_data(
+            make_args(rewards_normalization=False, use_rollout_routing_replay=True),
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        np.testing.assert_array_equal(out["rollout_routed_experts"][0], sample.rollout_routed_experts)
+
 
 _AGENTIC_VARIANTS = ["agentic_tool_call"]
 _AGENT_METADATA = {"reward": 1.0, "exit_status": "Submitted", "eval_report": {"passed": True}}
@@ -791,7 +833,7 @@ class TestAgentCollectionFailure:
     @pytest.mark.parametrize(
         "collect_error",
         [
-            pytest.param(asyncio.TimeoutError(), id="timeout"),
+            pytest.param(TimeoutError(), id="timeout"),
             # A broken connection to the session server is one sample's problem: in-place
             # weight updates pause generation under in-flight requests, so letting it
             # propagate takes the whole run down over a routine event.
@@ -834,6 +876,7 @@ class TestAgentNoRecords:
             make_args,
             with_session_server,
         )
+
         from miles.utils.http_utils import find_available_port
         from miles.utils.misc import SingletonMeta
         from miles.utils.test_utils.mock_sglang_server import with_mock_server

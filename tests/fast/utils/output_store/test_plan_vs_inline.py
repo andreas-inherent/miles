@@ -147,6 +147,11 @@ def run_case(
             respond(store, response.store_meta_info, mode=mode, k=k, routed_experts=routed_experts, via_store=True)
             if response.arrays is not None:
                 objects[key] = response.arrays
+        if turn == num_turns - 1 and not abort_last and rng.random() < 0.3:
+            # The turn limit or context budget ends the rollout on a tool observation no forward ran.
+            observation = tokens_of(rng, 1, 3)
+            for sample in (inline, store):
+                tool_call_utils.update_sample_with_tool_responses(sample, observation, Tokenizer())
         inline_turns.append(inline)
         store_turns.append(store)
         prefix = inline.tokens
@@ -176,6 +181,7 @@ def test_store_sample_equals_inline_sample(seed):
 
     inline, store, objects = run_case(rng, mode=mode, k=k, routed_experts=routed_experts)
 
+    inline.validate()
     for field in ("tokens", "response_length", "loss_mask", "rollout_log_probs", "status"):
         assert getattr(store, field) == getattr(inline, field), field
     assert store.rollout_sampling_mask is None and store.rollout_routed_experts is None
