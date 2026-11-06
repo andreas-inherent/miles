@@ -190,10 +190,24 @@ class TestEdits:
         with pytest.raises(StorePlanError, match="continues from row 5, but only 0 rows precede it"):
             RoutedExpertsSegments().append(later.fields[R3])
 
-    def test_a_tool_observation_adds_forced_mask_rows_only(self):
+    def test_a_tool_observation_adds_ref_less_rows_to_every_field(self):
         plan = response("a", prompt=3, output=2).insert_tokens(3)
-        assert segs(plan, R3) == [("a", 0, 4)] and segs(plan, MASK) == [("a", 0, 2), (None, 0, 3)]
+        assert segs(plan, R3) == segs(plan, INDEXER) == [("a", 0, 4), (None, 0, 3)]
+        assert segs(plan, MASK) == [("a", 0, 2), (None, 0, 3)]
+        plan.validate(num_tokens=8, response_length=5)
         assert plan.insert_tokens(0) == plan
+
+    def test_an_incremental_forward_cannot_keep_rows_no_forward_ran(self):
+        # 3 observation tokens after rows 0..3, but the next object starts at position 6.
+        before = response("a", prompt=3, output=2, requested={R3}).insert_tokens(3)
+        later = StorePlan.from_response(
+            Ref("b", (Spec(R3, "int32", (3, 2, 4)),)),
+            request=request({R3}, routed_experts_start_len=6),
+            num_tokens=10,
+            response_length=1,
+        )
+        with pytest.raises(StorePlanError, match="continues from row 6, past rows no forward ran"):
+            before.append_response(later)
 
     def test_session_merge_puts_forced_rows_between_turns_and_keeps_the_later_forward(self):
         turn1 = response("a", prompt=3, output=2)
@@ -357,6 +371,17 @@ class TestMaterializeForward:
         assert columns["rollout_routed_experts"].dtype == np.int32
         partial = rows_of(R3, ("b", 1, 3)).materialize(objects, response_tokens=np.empty(0), **opts())
         np.testing.assert_array_equal(partial["rollout_routed_experts"], b[1:3])
+
+    def test_ref_less_rows_are_minus_one_as_inline(self):
+        a = r3(4, 1)
+
+        columns = rows_of(R3, ("a", 0, 4), (None, 0, 3)).materialize(
+            {"a": {R3: a}}, response_tokens=np.empty(0), **opts()
+        )
+
+        expected = np.concatenate([a, np.full((3, 2, 4), -1, dtype=np.int32)])
+        np.testing.assert_array_equal(columns["rollout_routed_experts"], expected)
+        assert columns["rollout_routed_experts"].dtype == np.int32
 
     def test_all_zero_routed_experts_are_rejected_per_object(self):
         objects = {"a": {R3: r3(4, 1)}, "b": {R3: np.zeros((3, 2, 4), dtype=np.int32)}}
