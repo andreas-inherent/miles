@@ -29,15 +29,18 @@ from miles.utils.output_store.plan import (
     MASK_TOKEN_IDS,
     OUTPUT_STORE_REF_KEY,
     OUTPUT_STORE_REQUEST_KEY,
+    IndexerTopkSegments,
     RoutedExpertsSegments,
     StorePlanError,
 )
 from miles.utils.types import Sample
 
 R3 = RoutedExpertsSegments.name
+INDEXER = IndexerTopkSegments.name
 VOCAB = 64
 SELECTED_MAX_SUPPORT = 6
 LAYERS, EXPERTS_PER_TOKEN = 2, 3
+INDEXER_STREAMS, INDEXER_TOPK = 2, 4
 TOPK_COLUMNS = ("rollout_topk_token_ids", "rollout_topk_log_probs")
 
 
@@ -93,6 +96,11 @@ def generate(
         rows = rng.integers(1, 64, size=(num_tokens + len(tokens) - 1, LAYERS, EXPERTS_PER_TOKEN), dtype=np.int32)
         inline["routed_experts"] = pybase64.b64encode(rows.tobytes()).decode()
         arrays[R3] = rows
+        # A DSA model returns indexer top-k with them, over the same positions.
+        indexer = rng.integers(0, num_tokens, size=(len(rows), INDEXER_STREAMS, INDEXER_TOPK), dtype=np.int32)
+        inline["indexer_topk"] = pybase64.b64encode(indexer.tobytes()).decode()
+        inline["indexer_topk_num_layers"] = INDEXER_STREAMS
+        arrays[INDEXER] = indexer
     store[OUTPUT_STORE_REF_KEY] = Ref(
         key, tuple(Spec(n, a.dtype.name, a.shape) for n, a in arrays.items())
     ).to_builtins()
@@ -106,10 +114,14 @@ def respond(sample: Sample, meta_info: dict, *, mode: str, k: int, routed_expert
         payload["sampling_logprobs_mode"] = "support"
     if routed_experts:
         payload[RoutedExpertsSegments.request_key] = True
+        payload[IndexerTopkSegments.request_key] = True
     if via_store:
         payload[OUTPUT_STORE_REQUEST_KEY] = True
     args = Namespace(
-        rollout_top_logprobs_num=k, sglang=make_sglang_config(speculative_algorithm=None), num_layers=LAYERS
+        rollout_top_logprobs_num=k,
+        sglang=make_sglang_config(speculative_algorithm=None),
+        num_layers=LAYERS,
+        rollout_indexer_topk_num_streams=INDEXER_STREAMS,
     )
     output = {"text": "", "meta_info": meta_info}
     asyncio.run(update_sample_from_response(args, sample, payload, output, update_loss_mask=True))
@@ -147,6 +159,11 @@ def run_case(
             respond(store, response.store_meta_info, mode=mode, k=k, routed_experts=routed_experts, via_store=True)
             if response.arrays is not None:
                 objects[key] = response.arrays
+        if turn == num_turns - 1 and not abort_last and rng.random() < 0.3:
+            # The turn limit or context budget ends the rollout on a tool observation no forward ran.
+            observation = tokens_of(rng, 1, 3)
+            for sample in (inline, store):
+                tool_call_utils.update_sample_with_tool_responses(sample, observation, Tokenizer())
         inline_turns.append(inline)
         store_turns.append(store)
         prefix = inline.tokens
@@ -176,15 +193,20 @@ def test_store_sample_equals_inline_sample(seed):
 
     inline, store, objects = run_case(rng, mode=mode, k=k, routed_experts=routed_experts)
 
+    inline.validate()
     for field in ("tokens", "response_length", "loss_mask", "rollout_log_probs", "status"):
         assert getattr(store, field) == getattr(inline, field), field
     assert store.rollout_sampling_mask is None and store.rollout_routed_experts is None
+    assert store.rollout_indexer_topk is None
     assert store.rollout_topk_token_ids is None and store.rollout_topk_log_probs is None
     plan = store.rollout_store_plan
     if routed_experts and inline.rollout_routed_experts is None:
-        # A no-output abort ended the sample: inline it has no routed experts, the plan no rows.
-        assert plan.fields[R3].num_rows() == 0
-        plan = replace(plan, fields={name: segments for name, segments in plan.fields.items() if name != R3})
+        # A no-output abort ended the sample: inline it has no replay rows, the plan none either.
+        assert inline.rollout_indexer_topk is None
+        assert plan.fields[R3].num_rows() == plan.fields[INDEXER].num_rows() == 0
+        plan = replace(
+            plan, fields={name: segments for name, segments in plan.fields.items() if name not in (R3, INDEXER)}
+        )
     plan.validate(num_tokens=len(store.tokens), response_length=store.response_length)
     response_tokens = np.asarray(store.tokens[len(store.tokens) - store.response_length :], dtype=np.int64)
     columns = plan.materialize(
@@ -201,6 +223,9 @@ def test_store_sample_equals_inline_sample(seed):
     if R3 in plan.fields:
         assert columns["rollout_routed_experts"].dtype == inline.rollout_routed_experts.dtype == np.int32
         np.testing.assert_array_equal(columns["rollout_routed_experts"], inline.rollout_routed_experts)
+    if INDEXER in plan.fields:
+        assert columns["rollout_indexer_topk"].dtype == inline.rollout_indexer_topk.dtype == np.int32
+        np.testing.assert_array_equal(columns["rollout_indexer_topk"], inline.rollout_indexer_topk)
     if mode == "selected":
         assert set(columns).isdisjoint(TOPK_COLUMNS) and inline.rollout_topk_token_ids is None
         return

@@ -168,6 +168,9 @@ class ForwardSegments(Segments):
     - 0: the object holds every row, and ``append`` replaces all earlier rows;
     - ``start`` > 0: the object holds rows from ``start`` on, preceded by a ref-less segment of
       ``start`` rows, which ``append`` fills with the earlier plan's first ``start`` rows.
+
+    ``insert`` appends a ref-less segment for tokens no forward ran yet, such as a final tool
+    observation; it materializes as -1 rows, the inline path's padding, until a later response replaces it.
     """
 
     column: ClassVar[str]
@@ -198,11 +201,15 @@ class ForwardSegments(Segments):
             raise StorePlanError(
                 f"{self.name} continues from row {covered}, but only {self.num_rows()} rows precede it"
             )
-        return type(self)(self.prefix(covered).segs + new.segs[1 if covered else 0 :])
+        kept = self.prefix(covered).segs
+        if any(seg.ref is None for seg in kept):
+            # Inserted rows the next forward does not cover would never be replaced.
+            raise StorePlanError(f"{self.name} continues from row {covered}, past rows no forward ran")
+        return type(self)(kept + new.segs[1 if covered else 0 :])
 
     def insert(self, n: int) -> Segments:
-        # The next forward covers the inserted tokens.
-        return self
+        # Ref-less rows until the next forward replaces them; they materialize as -1, as inline.
+        return type(self)(self.segs + (Seg(None, 0, n),)) if n else self
 
     @staticmethod
     def expected_rows(*, num_tokens: int, response_length: int) -> int:
@@ -217,9 +224,24 @@ class ForwardSegments(Segments):
         indexer_streams: int | None,
     ) -> dict[str, Any]:
         (name,) = self.stored
-        for key in dict.fromkeys(seg.ref.key for seg in self.segs):
-            self.check(objects[key][name], indexer_streams=indexer_streams)
-        return {self.column: np.concatenate([objects[seg.ref.key][name][seg.start : seg.end] for seg in self.segs])}
+        stored = {seg.ref.key: objects[seg.ref.key][name] for seg in self.segs if seg.ref is not None}
+        for rows in stored.values():
+            self.check(rows, indexer_streams=indexer_streams)
+        if not stored:
+            raise StorePlanError(f"{self.name} has {self.num_rows()} rows and none of them stored")
+        first = next(iter(stored.values()))
+        return {
+            self.column: np.concatenate(
+                [
+                    (
+                        stored[seg.ref.key][seg.start : seg.end]
+                        if seg.ref is not None
+                        else np.full((seg.end - seg.start, *first.shape[1:]), -1, dtype=first.dtype)
+                    )
+                    for seg in self.segs
+                ]
+            )
+        }
 
     def check(self, rows: np.ndarray, *, indexer_streams: int | None) -> None:
         """The field's check of every row one response stored."""
