@@ -11,6 +11,7 @@ from miles.ray.placement_group import (
 )
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
 from miles.ray.specs.train import compute_trainer_configs
+from miles.utils import checkpoint_decay
 from miles.utils.arguments import validate_async_off_policy_correction
 from miles.utils.async_utils import Disposer, eager_create_task, with_disposer
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
@@ -144,6 +145,15 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
             if args.use_critic:
                 await save_training_model(critic_model, rollout_id, force_sync)
             await rollout_executor.save(rollout_id)
+            if args.keep_recent_checkpoints is not None:
+                await asyncio.to_thread(
+                    checkpoint_decay.prune_checkpoints,
+                    args.save,
+                    saved_step=rollout_id,
+                    keep_recent=args.keep_recent_checkpoints,
+                    keep_every=args.keep_checkpoint_every,
+                    pin_saved=external_save,
+                )
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
