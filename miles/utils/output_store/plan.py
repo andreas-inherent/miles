@@ -227,6 +227,8 @@ class ForwardSegments(Segments):
         stored = {seg.ref.key: objects[seg.ref.key][name] for seg in self.segs if seg.ref is not None}
         for rows in stored.values():
             self.check(rows, indexer_streams=indexer_streams)
+        if not stored:
+            raise StorePlanError(f"{self.name} has {self.num_rows()} rows and none of them stored")
         first = next(iter(stored.values()))
         return {
             self.column: np.concatenate(

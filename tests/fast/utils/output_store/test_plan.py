@@ -383,6 +383,10 @@ class TestMaterializeForward:
         np.testing.assert_array_equal(columns["rollout_routed_experts"], expected)
         assert columns["rollout_routed_experts"].dtype == np.int32
 
+    def test_a_field_without_stored_rows_is_rejected(self):
+        with pytest.raises(StorePlanError, match="3 rows and none of them stored"):
+            rows_of(R3, (None, 0, 3)).materialize({}, response_tokens=np.empty(0), **opts())
+
     def test_all_zero_routed_experts_are_rejected_per_object(self):
         objects = {"a": {R3: r3(4, 1)}, "b": {R3: np.zeros((3, 2, 4), dtype=np.int32)}}
         with pytest.raises(StorePlanError, match="all zeros"):

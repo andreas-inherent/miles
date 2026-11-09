@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -719,6 +720,7 @@ class TestRoutedExpertsMultiTurn:
         assert (sample.rollout_routed_experts[rows:] == -1).all() and len(
             sample.rollout_routed_experts
         ) - rows == observation
+        sample.validate()
         sample.reward = 1.0
         out = convert_samples_to_train_data(
             make_args(rewards_normalization=False, use_rollout_routing_replay=True),
@@ -833,7 +835,7 @@ class TestAgentCollectionFailure:
     @pytest.mark.parametrize(
         "collect_error",
         [
-            pytest.param(TimeoutError(), id="timeout"),
+            pytest.param(asyncio.TimeoutError(), id="timeout"),
             # A broken connection to the session server is one sample's problem: in-place
             # weight updates pause generation under in-flight requests, so letting it
             # propagate takes the whole run down over a routine event.
