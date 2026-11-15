@@ -45,3 +45,11 @@ class TestCheckKl:
                 step_id=0,
                 accumulated_step_id=1,
             )
+
+    def test_first_step_kl_loss_check_covers_rollout_routing_replay(self) -> None:
+        """The ref replays rollout routing, so a step-0 kl_loss under R3 must fail like any other."""
+        args = Namespace(trainer_model_id=None, use_rollout_routing_replay=True)
+
+        check_kl(args=args, log_dict={"train/kl_loss": 0.0}, step_id=1, accumulated_step_id=0)
+        with pytest.raises(AssertionError):
+            check_kl(args=args, log_dict={"train/kl_loss": 0.007}, step_id=1, accumulated_step_id=0)
